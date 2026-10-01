@@ -11,12 +11,10 @@
 
 #include <cstddef>
 #include <exception>
-#include <experimental/scope>
 #include <expected>
 #include <memory>
 #include <algorithm>
 #include <array>
-#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -203,77 +201,6 @@ template <class F> std::expected<mrb_value, mrb_value> protect(mrb_state *const 
         return std::unexpected(answer);
     return answer;
 }
-
-class instance_variable
-{
-    mrb_state *mrb;
-    mrb_value holder;
-    mrb_sym name;
-
-    void set(const mrb_value value)
-    {
-        RBasic *const object = mrb_basic_ptr(holder);
-        const bool was = mrb_frozen_p(object);
-        object->frozen = 0;
-        const std::experimental::scope_exit refreeze([object, was] { object->frozen = was; });
-        mrb_iv_set(mrb, holder, name, value);
-    }
-    mrb_value list()
-    {
-        const mrb_value held = mrb_iv_get(mrb, holder, name);
-        if (mrb_array_p(held))
-            return held;
-        const mrb_value made = mrb_ary_new(mrb);
-        set(made);
-        return made;
-    }
-
-    static bool has_instance_variables(const mrb_value owner)
-    {
-        constexpr std::array holders{MRB_TT_OBJECT, MRB_TT_CLASS, MRB_TT_MODULE,   MRB_TT_SCLASS,
-                                     MRB_TT_HASH,   MRB_TT_CDATA, MRB_TT_EXCEPTION};
-        return !mrb_immediate_p(owner) && std::ranges::contains(holders, mrb_type(owner));
-    }
-
-  public:
-    instance_variable(mrb_state *const given, const mrb_value owner, const std::string_view field)
-        : mrb(given), holder(owner),
-          name(has_instance_variables(owner)
-                   ? mrb_intern_cstr(given, ("__" + std::string(field) + "__").c_str())
-                   : throw std::logic_error("mruby::instance_variable keeps a value only on an "
-                                            "object that has instance variables"))
-    {
-    }
-    void assign(const mrb_value value)
-    {
-        set(value);
-    }
-    void push_back(const mrb_value value)
-    {
-        mrb_ary_push(mrb, list(), value);
-    }
-    void erase(const mrb_value value)
-    {
-        const mrb_value held = mrb_iv_get(mrb, holder, name);
-        if (!mrb_array_p(held))
-            return;
-        const std::span<const mrb_value> values(RARRAY_PTR(held),
-                                                static_cast<std::size_t>(RARRAY_LEN(held)));
-        const auto found = std::ranges::find_if(
-            values, [&](const mrb_value v) { return mrb_obj_eq(mrb, v, value); });
-        if (found != values.end())
-            mrb_ary_splice(mrb, held, static_cast<mrb_int>(std::distance(values.begin(), found)), 1,
-                           mrb_undef_value());
-    }
-    void clear()
-    {
-        RBasic *const object = mrb_basic_ptr(holder);
-        const bool was = mrb_frozen_p(object);
-        object->frozen = 0;
-        const std::experimental::scope_exit refreeze([object, was] { object->frozen = was; });
-        mrb_iv_remove(mrb, holder, name);
-    }
-};
 
 template <std::size_t N> struct literal {
     std::array<char, N> bytes{};

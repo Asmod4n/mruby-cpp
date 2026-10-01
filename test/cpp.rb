@@ -78,29 +78,6 @@ assert('mruby::protect gives a C++ exception back as itself') do
   assert_true MrubyCppTest.protect_rethrows_cxx_exception?
 end
 
-# A value that a C++ object keeps lives on its Ruby holder, under the name
-# of the C++ field, where Ruby cannot reach it. Each operation mirrors what
-# C++ does with the field.
-assert('mruby::instance_variable mirrors the field of a C++ object') do
-  holder = Object.new
-  first = 'a'
-  second = 'b'
-  assert_equal first, MrubyCppTest.instance_variable_after(holder, :assign, first)
-  assert_equal [], holder.instance_variables
-  holder = Object.new
-  assert_equal [first], MrubyCppTest.instance_variable_after(holder, :push_back, first)
-  assert_equal [first, second], MrubyCppTest.instance_variable_after(holder, :push_back, second)
-  assert_equal [second], MrubyCppTest.instance_variable_after(holder, :erase, first)
-  assert_nil MrubyCppTest.instance_variable_after(holder, :clear, nil)
-  # The ivar is bookkeeping of the C++ field and not a change the user
-  # made, so it works on a holder the user froze, which stays frozen.
-  frozen = Object.new.freeze
-  assert_equal [first], MrubyCppTest.instance_variable_after(frozen, :push_back, first)
-  assert_true frozen.frozen?
-  assert_nil MrubyCppTest.instance_variable_after(Object.new, :erase, first)
-  assert_true MrubyCppTest.instance_variable_on_integer_throws?
-end
-
 # mrb_intern_static and mrb_str_new_static keep the pointer they are given,
 # so the bytes must live as long as the state. A literal does.
 assert('mruby::symbol and mruby::str_new_static read a literal') do

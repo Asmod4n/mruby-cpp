@@ -68,17 +68,6 @@ static mrb_value singleton_frozen_m(mrb_state *mrb, mrb_value)
                                        mrb_bool_value(mrb_frozen_p(object->c))));
 }
 
-/* Whether mruby::instance_variable refuses a holder that has no instance variables. */
-static mrb_value instance_variable_on_integer_throws_q(mrb_state *mrb, mrb_value)
-{
-    try {
-        mruby::instance_variable field(mrb, mrb_fixnum_value(1), "children");
-    } catch (const std::logic_error &) {
-        return mrb_true_value();
-    }
-    return mrb_false_value();
-}
-
 // Each requirement names a constructor the type has, so the concept is
 // false only because operator new is deleted, and not because no
 // constructor matches.
@@ -189,26 +178,6 @@ static mrb_value protect_rethrows_cxx_exception_q(mrb_state *, mrb_value)
     return mrb_bool_value(caught && !raised && answered && mrb_fixnum(*answered) == 3);
 }
 
-/* Applies one operation of mruby::instance_variable to the holder, and answers what the
- * hidden instance variable holds afterwards. */
-static mrb_value instance_variable_after_m(mrb_state *mrb, mrb_value)
-{
-    mrb_value holder, value;
-    mrb_sym how;
-    mrb_get_args(mrb, "ono", &holder, &how, &value);
-    mruby::instance_variable field(mrb, holder, "children");
-    const std::string_view operation = mrb_sym_name(mrb, how);
-    if (operation == "assign")
-        field.assign(value);
-    else if (operation == "push_back")
-        field.push_back(value);
-    else if (operation == "erase")
-        field.erase(value);
-    else
-        field.clear();
-    return mrb_iv_get(mrb, holder, mruby::symbol<"__children__">(mrb));
-}
-
 /* Whether the literal functions give back the bytes of the literal. */
 static mrb_value literals_q(mrb_state *mrb, mrb_value)
 {
@@ -236,10 +205,6 @@ extern "C" void mrb_mruby_cpp_gem_test(mrb_state *mrb)
                                MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "protect_rethrows_cxx_exception?",
                                protect_rethrows_cxx_exception_q, MRB_ARGS_NONE());
-    mrb_define_module_function(mrb, test, "instance_variable_after", instance_variable_after_m,
-                               MRB_ARGS_REQ(3));
     mrb_define_module_function(mrb, test, "singleton_frozen", singleton_frozen_m, MRB_ARGS_REQ(1));
-    mrb_define_module_function(mrb, test, "instance_variable_on_integer_throws?",
-                               instance_variable_on_integer_throws_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "literals?", literals_q, MRB_ARGS_NONE());
 }
