@@ -22,6 +22,14 @@ assert('mruby::frozen refuses a change, and thaws on a raise') do
   assert_equal 'abc', text
 end
 
+# Ruby's freeze also freezes the singleton class, so that no singleton
+# method can be added. mruby::frozen does the same, and thaws both after.
+assert('mruby::frozen freezes the singleton class as freeze does') do
+  object = Object.new
+  def object.x; end
+  assert_equal [[true, true], [false, false]], MrubyCppTest.singleton_frozen(object)
+end
+
 assert('mruby::frozen stays frozen until the outer one ends') do
   text = 'abc'
   assert_true MrubyCppTest.frozen_after_inner?(text)
@@ -81,6 +89,13 @@ assert('mruby::kept mirrors the field of a C++ object') do
   assert_equal [first, second], MrubyCppTest.kept_after(holder, :push_back, second)
   assert_equal [second], MrubyCppTest.kept_after(holder, :erase, first)
   assert_nil MrubyCppTest.kept_after(holder, :clear, nil)
+  # The ivar is bookkeeping of the C++ field and not a change the user
+  # made, so it works on a holder the user froze, which stays frozen.
+  frozen = Object.new.freeze
+  assert_equal [first], MrubyCppTest.kept_after(frozen, :push_back, first)
+  assert_true frozen.frozen?
+  assert_nil MrubyCppTest.kept_after(Object.new, :erase, first)
+  assert_true MrubyCppTest.kept_on_integer_throws?
 end
 
 # mruby says nothing when it frees an object, but it calls dfree for a data

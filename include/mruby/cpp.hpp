@@ -32,19 +32,21 @@ class automatic;
 
 class frozen {
     RBasic *object = nullptr;
+    RBasic *singleton = nullptr;
     bool thaws = false;
 
-    void freeze(const mrb_value given)
+    void freeze(mrb_state *const mrb, const mrb_value given)
     {
         if (mrb_immediate_p(given)) return;
         object = mrb_basic_ptr(given);
         thaws = !mrb_frozen_p(object);
-        object->frozen = 1;
+        if (thaws && object->c->tt == MRB_TT_SCLASS && !mrb_frozen_p(object->c)) singleton = reinterpret_cast<RBasic *>(object->c);
+        mrb_obj_freeze(mrb, given);
     }
 
 public:
-    explicit frozen(const automatic &given);
-    explicit frozen(const std::shared_ptr<const mrb_value> &given) { freeze(*given); }
+    frozen(mrb_state *mrb, const automatic &given);
+    frozen(mrb_state *const mrb, const std::shared_ptr<const mrb_value> &given) { freeze(mrb, *given); }
     frozen(const frozen &) = delete;
     frozen &operator=(const frozen &) = delete;
     static void *operator new(std::size_t) = delete;
@@ -52,6 +54,7 @@ public:
     ~frozen()
     {
         if (thaws) object->frozen = 0;
+        if (singleton != nullptr) singleton->frozen = 0;
     }
 };
 
@@ -67,7 +70,7 @@ public:
     operator mrb_value() const { return object; }
 };
 
-inline frozen::frozen(const automatic &given) { freeze(given); }
+inline frozen::frozen(mrb_state *const mrb, const automatic &given) { freeze(mrb, given); }
 
 template <class F>
 std::expected<mrb_value, mrb_value> protect(mrb_state *mrb, F &&body);
@@ -160,12 +163,28 @@ class kept {
     mrb_value holder;
     mrb_sym name;
 
-    mrb_value list() const
+    class thawed {
+        RBasic *object;
+        bool frozen;
+
+    public:
+        explicit thawed(const mrb_value given) : object(mrb_basic_ptr(given)), frozen(mrb_frozen_p(object)) { object->frozen = 0; }
+        thawed(const thawed &) = delete;
+        thawed &operator=(const thawed &) = delete;
+        ~thawed() { object->frozen = frozen; }
+    };
+
+    void set(const mrb_value value)
+    {
+        const thawed open(holder);
+        mrb_iv_set(mrb, holder, name, value);
+    }
+    mrb_value list()
     {
         const mrb_value held = mrb_iv_get(mrb, holder, name);
         if (mrb_array_p(held)) return held;
         const mrb_value made = mrb_ary_new(mrb);
-        mrb_iv_set(mrb, holder, name, made);
+        set(made);
         return made;
     }
 
@@ -173,17 +192,25 @@ public:
     kept(mrb_state *const given, const mrb_value owner, const std::string_view field)
         : mrb(given), holder(owner), name(mrb_intern_cstr(given, ("__" + std::string(field) + "__").c_str()))
     {
+        constexpr std::array holders{MRB_TT_OBJECT, MRB_TT_CLASS, MRB_TT_MODULE, MRB_TT_SCLASS, MRB_TT_HASH, MRB_TT_CDATA, MRB_TT_EXCEPTION};
+        if (mrb_immediate_p(owner) || !std::ranges::contains(holders, mrb_type(owner))) [[unlikely]]
+            throw std::logic_error("mruby::kept keeps a value only on an object that has instance variables");
     }
-    void assign(const mrb_value value) { mrb_iv_set(mrb, holder, name, value); }
+    void assign(const mrb_value value) { set(value); }
     void push_back(const mrb_value value) { mrb_ary_push(mrb, list(), value); }
     void erase(const mrb_value value)
     {
-        const mrb_value held = list();
+        const mrb_value held = mrb_iv_get(mrb, holder, name);
+        if (!mrb_array_p(held)) return;
         const std::span<const mrb_value> values(RARRAY_PTR(held), static_cast<std::size_t>(RARRAY_LEN(held)));
         const auto found = std::ranges::find_if(values, [&](const mrb_value v) { return mrb_obj_eq(mrb, v, value); });
         if (found != values.end()) mrb_ary_splice(mrb, held, static_cast<mrb_int>(std::distance(values.begin(), found)), 1, mrb_undef_value());
     }
-    void clear() { mrb_iv_remove(mrb, holder, name); }
+    void clear()
+    {
+        const thawed open(holder);
+        mrb_iv_remove(mrb, holder, name);
+    }
 };
 
 template <class T>

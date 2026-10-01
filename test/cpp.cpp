@@ -17,7 +17,7 @@ static mrb_value frozen_while_held_q(mrb_state *mrb, mrb_value)
     mrb_value given;
     mrb_get_args(mrb, "o", &given);
     const mruby::automatic argument(given);
-    const mruby::frozen held(argument);
+    const mruby::frozen held(mrb, argument);
     return mrb_bool_value(!mrb_immediate_p(given) && mrb_frozen_p(mrb_basic_ptr(given)));
 }
 
@@ -27,7 +27,7 @@ static mrb_value append_while_frozen(mrb_state *mrb, mrb_value)
     mrb_value given;
     mrb_get_args(mrb, "S", &given);
     const mruby::automatic argument(given);
-    const mruby::frozen held(argument);
+    const mruby::frozen held(mrb, argument);
     mrb_str_cat_lit(mrb, given, "x");
     return given;
 }
@@ -39,15 +39,43 @@ static mrb_value frozen_after_inner_q(mrb_state *mrb, mrb_value)
     mrb_value given;
     mrb_get_args(mrb, "o", &given);
     const mruby::automatic argument(given);
-    const mruby::frozen outer(argument);
+    const mruby::frozen outer(mrb, argument);
     {
-        const mruby::frozen inner(argument);
+        const mruby::frozen inner(mrb, argument);
     }
     return mrb_bool_value(mrb_frozen_p(mrb_basic_ptr(given)));
 }
 
+/* Answers, for an object with a singleton class, whether the object and
+ * its singleton class are frozen while a mruby::frozen exists and after
+ * it ended. */
+static mrb_value singleton_frozen_m(mrb_state *mrb, mrb_value)
+{
+    mrb_value given;
+    mrb_get_args(mrb, "o", &given);
+    RBasic *const object = mrb_basic_ptr(given);
+    mrb_value during = mrb_nil_value();
+    {
+        const mruby::automatic argument(given);
+        const mruby::frozen held(mrb, argument);
+        during = mrb_assoc_new(mrb, mrb_bool_value(mrb_frozen_p(object)), mrb_bool_value(mrb_frozen_p(object->c)));
+    }
+    return mrb_assoc_new(mrb, during, mrb_assoc_new(mrb, mrb_bool_value(mrb_frozen_p(object)), mrb_bool_value(mrb_frozen_p(object->c))));
+}
+
+/* Whether mruby::kept refuses a holder that has no instance variables. */
+static mrb_value kept_on_integer_throws_q(mrb_state *mrb, mrb_value)
+{
+    try {
+        mruby::kept field(mrb, mrb_fixnum_value(1), "children");
+    } catch (const std::logic_error &) {
+        return mrb_true_value();
+    }
+    return mrb_false_value();
+}
+
 template <class T>
-concept made_with_new = requires { new T(mrb_nil_value()); };
+concept made_with_new = requires { new T(static_cast<mrb_state *>(nullptr), mrb_nil_value()); } || requires { new T(mrb_nil_value()); };
 
 /* Whether mruby::frozen and mruby::automatic refuse every way out of the
  * scope that made them: a copy, a move and new. */
@@ -190,6 +218,8 @@ extern "C" void mrb_mruby_cpp_gem_test(mrb_state *mrb)
     mrb_define_module_function(mrb, test, "root_after_close_is_nil?", root_after_close_is_nil_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "protect_returns_raise?", protect_returns_raise_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "kept_after", kept_after_m, MRB_ARGS_REQ(3));
+    mrb_define_module_function(mrb, test, "singleton_frozen", singleton_frozen_m, MRB_ARGS_REQ(1));
+    mrb_define_module_function(mrb, test, "kept_on_integer_throws?", kept_on_integer_throws_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "counted_new", counted_new_m, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "wrap_in_other_class_throws?", wrap_in_other_class_throws_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "data_weak_expires?", data_weak_expires_q, MRB_ARGS_NONE());
