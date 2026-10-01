@@ -51,16 +51,25 @@ assert('mruby::root keeps a value through a full collection') do
   assert_true MrubyCppTest.root_keeps_value?
 end
 
-# A destructor may not run mruby, so releasing a root only lists it. The
-# next root unregisters it, and the collector then frees the object.
-assert('a released mruby::root is collected after the next root') do
+# mrb_gc_unregister only looks the object up in a hash table and counts
+# down (src/gc.c), so the deleter of a root calls it at once, and the
+# collector then frees the object.
+assert('a released mruby::root is collected') do
   assert_true MrubyCppTest.released_root_is_collected?
 end
 
 # mrb_close frees every object. A root that outlives its state must not
-# point into freed memory.
-assert('an mruby::root that outlives its state reads nil') do
-  assert_true MrubyCppTest.root_after_close_is_nil?
+# point into freed memory. It reads undef and not nil, because nil is a
+# value a root can legally hold.
+assert('an mruby::root that outlives its state reads undef') do
+  assert_true MrubyCppTest.root_after_close_is_undef?
+end
+
+# mrb_close frees the table of roots before it frees the heap (src/gc.c,
+# mrb_gc_destroy), and the dfree of a data object can release a root on
+# its way out. mrb_gc_unregister returns at once when the table is gone.
+assert('a root released by a dfree inside mrb_close') do
+  assert_true MrubyCppTest.root_released_in_close?
 end
 
 # mruby aborts the process for a raise with no handler above it

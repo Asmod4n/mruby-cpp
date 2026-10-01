@@ -106,10 +106,9 @@ static mrb_value root_keeps_value_q(mrb_state *, mrb_value)
     return mrb_bool_value(RSTRING_LEN(*kept) == 3);
 }
 
-/* Whether a released root lets the collector free its object once the
- * next root has unregistered it. The object is a data object whose dfree
- * sets a flag, because reading the object after the collection would read
- * memory that mruby may have given back. */
+/* Whether a released root lets the collector free its object. The object is a data object whose
+ * dfree sets a flag, because reading the object after the collection would read memory that mruby
+ * may have given back. */
 static mrb_value released_root_is_collected_q(mrb_state *, mrb_value)
 {
     static constexpr mrb_data_type marks_freed{
@@ -121,24 +120,49 @@ static mrb_value released_root_is_collected_q(mrb_state *, mrb_value)
     std::shared_ptr<const mrb_value> kept = owned.root(mruby::automatic(
         mrb_obj_value(mrb_data_object_alloc(mrb, mrb->object_class, &freed, &marks_freed))));
     kept.reset();
-    const std::shared_ptr<const mrb_value> next = owned.root(mruby::automatic(mrb_nil_value()));
     mrb_gc_arena_restore(mrb, arena);
     mrb_full_gc(mrb);
     return mrb_bool_value(freed);
 }
 
-/* Whether a root that outlives its state reads nil instead of freed memory,
- * and can be released afterwards. */
-static mrb_value root_after_close_is_nil_q(mrb_state *, mrb_value)
+/* Whether a root that outlives its state reads undef instead of freed
+ * memory, and can be released afterwards. */
+static mrb_value root_after_close_is_undef_q(mrb_state *, mrb_value)
 {
     std::shared_ptr<const mrb_value> survivor;
     {
         mruby::state owned;
         survivor = owned.root(mruby::automatic(mrb_str_new_lit(owned.get(), "abc")));
     }
-    const bool nil = mrb_nil_p(*survivor);
+    const bool undef = mrb_undef_p(*survivor);
     survivor.reset();
-    return mrb_bool_value(nil);
+    return mrb_bool_value(undef);
+}
+
+struct holds_root {
+    std::shared_ptr<const mrb_value> held;
+    bool *released;
+};
+
+/* Whether a root that the dfree of a data object releases while mrb_close
+ * frees the heap is released without a fault. */
+static mrb_value root_released_in_close_q(mrb_state *, mrb_value)
+{
+    static constexpr mrb_data_type releases_root{"releases_root", [](mrb_state *, void *const p) {
+                                                     holds_root *const holder =
+                                                         static_cast<holds_root *>(p);
+                                                     *holder->released = true;
+                                                     delete holder;
+                                                 }};
+    bool released = false;
+    {
+        mruby::state owned;
+        mrb_state *const mrb = owned.get();
+        holds_root *const holder =
+            new holds_root{owned.root(mruby::automatic(mrb_str_new_lit(mrb, "abc"))), &released};
+        mrb_data_object_alloc(mrb, mrb->object_class, holder, &releases_root);
+    }
+    return mrb_bool_value(released);
 }
 
 /* Whether a raise in a state that C++ owns, where no Ruby frame is above,
@@ -199,7 +223,9 @@ extern "C" void mrb_mruby_cpp_gem_test(mrb_state *mrb)
     mrb_define_module_function(mrb, test, "root_keeps_value?", root_keeps_value_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "released_root_is_collected?",
                                released_root_is_collected_q, MRB_ARGS_NONE());
-    mrb_define_module_function(mrb, test, "root_after_close_is_nil?", root_after_close_is_nil_q,
+    mrb_define_module_function(mrb, test, "root_released_in_close?", root_released_in_close_q,
+                               MRB_ARGS_NONE());
+    mrb_define_module_function(mrb, test, "root_after_close_is_undef?", root_after_close_is_undef_q,
                                MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "protect_returns_raise?", protect_returns_raise_q,
                                MRB_ARGS_NONE());

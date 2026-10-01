@@ -18,12 +18,10 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
-#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
-#include <vector>
 
 namespace mruby
 {
@@ -96,8 +94,6 @@ class state
     struct owned {
         mrb_state *mrb = nullptr;
         std::thread::id owner = std::this_thread::get_id();
-        std::mutex lock;
-        std::vector<mrb_value> released;
         std::unordered_set<mrb_value *> roots;
     };
     std::shared_ptr<owned> shared = std::make_shared<owned>();
@@ -113,13 +109,9 @@ class state
     state &operator=(const state &) = delete;
     ~state()
     {
-        {
-            const std::scoped_lock hold(shared->lock);
-            for (mrb_value *const cell : shared->roots)
-                *cell = mrb_nil_value();
-            shared->roots.clear();
-            shared->released.clear();
-        }
+        for (mrb_value *const cell : shared->roots)
+            *cell = mrb_undef_value();
+        shared->roots.clear();
         mrb_close(shared->mrb);
         shared->mrb = nullptr;
     }
@@ -135,14 +127,6 @@ inline std::shared_ptr<const mrb_value> state::root(const automatic &value)
     if (std::this_thread::get_id() != shared->owner) [[unlikely]]
         throw std::logic_error(
             "a thread tries to root a value of an mrb_state that another thread owns");
-    std::vector<mrb_value> released;
-    {
-        const std::scoped_lock hold(shared->lock);
-        released = shared->released;
-        shared->released.clear();
-    }
-    for (const mrb_value v : released)
-        mrb_gc_unregister(shared->mrb, v);
     std::unique_ptr<mrb_value> cell = std::make_unique<mrb_value>(value);
     const mrb_value registered = *cell;
     if (!protect(shared->mrb, [registered](mrb_state *const mrb) {
@@ -151,23 +135,16 @@ inline std::shared_ptr<const mrb_value> state::root(const automatic &value)
         })) [[unlikely]]
         throw std::bad_alloc();
     try {
-        const std::scoped_lock hold(shared->lock);
         shared->roots.insert(cell.get());
-        shared->released.reserve(shared->released.size() + shared->roots.size());
     } catch (const std::bad_alloc &) {
-        {
-            const std::scoped_lock hold(shared->lock);
-            shared->roots.erase(cell.get());
-        }
         mrb_gc_unregister(shared->mrb, registered);
         throw;
     }
     return std::shared_ptr<const mrb_value>(
         cell.release(), [watched = std::weak_ptr<state::owned>(shared)](const mrb_value *const p) {
             if (const std::shared_ptr<state::owned> alive = watched.lock(); alive != nullptr) {
-                const std::scoped_lock hold(alive->lock);
-                if (alive->roots.erase(const_cast<mrb_value *>(p)) != 0)
-                    alive->released.push_back(*p);
+                alive->roots.erase(const_cast<mrb_value *>(p));
+                mrb_gc_unregister(alive->mrb, *p);
             }
             delete p;
         });
