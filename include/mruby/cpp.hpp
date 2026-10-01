@@ -107,10 +107,10 @@ inline std::shared_ptr<const mrb_value> root(const state &owner, const automatic
         mrb_gc_unregister(shared->mrb, *cell);
         throw;
     }
-    return std::shared_ptr<const mrb_value>(cell.release(), [shared](const mrb_value *const p) {
-        {
-            const std::scoped_lock hold(shared->lock);
-            if (shared->roots.erase(const_cast<mrb_value *>(p)) != 0) shared->released.push_back(*p);
+    return std::shared_ptr<const mrb_value>(cell.release(), [watched = std::weak_ptr<life>(shared)](const mrb_value *const p) {
+        if (const std::shared_ptr<life> alive = watched.lock(); alive != nullptr) {
+            const std::scoped_lock hold(alive->lock);
+            if (alive->roots.erase(const_cast<mrb_value *>(p)) != 0) alive->released.push_back(*p);
         }
         delete p;
     });
