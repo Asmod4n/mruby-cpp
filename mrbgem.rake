@@ -1,8 +1,8 @@
 MRuby::Gem::Specification.new('mruby-cpp') do |spec|
-  spec.license = 'MPL-2'
+  spec.license = 'MPL-2.0'
   spec.authors = 'Hendrik Beskow'
   spec.summary = 'C++ types that state what mruby does with a value, so the compiler refuses a wrong use'
-  spec.export_include_paths << "#{spec.dir}/include" if spec.respond_to?(:export_include_paths)
+  spec.export_include_paths << "#{spec.dir}/include"
   spec.add_test_dependency 'mruby-string-ext', core: 'mruby-string-ext'
   spec.add_test_dependency 'mruby-metaprog', core: 'mruby-metaprog'
   years = { '98' => 1998, '03' => 2003, '0x' => 2011, '11' => 2011, '1y' => 2014, '14' => 2014, '1z' => 2017, '17' => 2017,
