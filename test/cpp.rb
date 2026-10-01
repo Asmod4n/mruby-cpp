@@ -66,15 +66,6 @@ assert('mruby::protect gives a raise back as a value') do
   assert_true MrubyCppTest.protect_returns_raise?
 end
 
-# dup and clone copy the instance variables of a data object, and not the
-# C++ object. Nobody can know whether a copy of the C++ object is safe.
-assert('a mruby::data object refuses dup and clone') do
-  counted = MrubyCppTest.counted_new
-  assert_raise(NotImplementedError) { counted.dup }
-  assert_raise(NotImplementedError) { counted.clone }
-  assert_true MrubyCppTest.wrap_in_other_class_throws?
-end
-
 # A value that a C++ object keeps lives on its Ruby holder, under the name
 # of the C++ field, where Ruby cannot reach it. Each operation mirrors what
 # C++ does with the field.
@@ -96,13 +87,6 @@ assert('mruby::kept mirrors the field of a C++ object') do
   assert_true frozen.frozen?
   assert_nil MrubyCppTest.kept_after(Object.new, :erase, first)
   assert_true MrubyCppTest.kept_on_integer_throws?
-end
-
-# mruby says nothing when it frees an object, but it calls dfree for a data
-# object. mruby::data holds the C++ object in a std::shared_ptr, so a
-# std::weak_ptr to it expires when the collector frees the Ruby object.
-assert('a std::weak_ptr to a mruby::data expires with the Ruby object') do
-  assert_true MrubyCppTest.data_weak_expires?
 end
 
 # mrb_intern_static and mrb_str_new_static keep the pointer they are given,

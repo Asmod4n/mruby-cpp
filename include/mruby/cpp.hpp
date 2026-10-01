@@ -2,7 +2,6 @@
 #include <mruby.h>
 #include <mruby/array.h>
 #include <mruby/class.h>
-#include <mruby/data.h>
 #include <mruby/error.h>
 #include <mruby/proc.h>
 #include <mruby/string.h>
@@ -18,7 +17,6 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
-#include <typeinfo>
 #include <mutex>
 #include <new>
 #include <stdexcept>
@@ -210,39 +208,6 @@ public:
     {
         const thawed open(holder);
         mrb_iv_remove(mrb, holder, name);
-    }
-};
-
-template <class T>
-    requires std::is_nothrow_destructible_v<T>
-struct data {
-    inline static const mrb_data_type type{typeid(T).name(), [](mrb_state *, void *const p) { delete static_cast<std::shared_ptr<T> *>(p); }};
-    static mrb_value initialize_copy(mrb_state *const mrb, const mrb_value self)
-    {
-        mrb_raisef(mrb, E_NOTIMP_ERROR, "%C holds a C++ object, and a copy of it is not known to be safe", mrb_obj_class(mrb, self));
-    }
-    static RClass *define_class(mrb_state *const mrb, const char *const name, RClass *const super)
-    {
-        RClass *const made = mrb_define_class(mrb, name, super);
-        MRB_SET_INSTANCE_TT(made, MRB_TT_CDATA);
-        mrb_define_method(mrb, made, "initialize_copy", initialize_copy, MRB_ARGS_REQ(1));
-        return made;
-    }
-    static mrb_value wrap(mrb_state *const mrb, RClass *const klass, std::shared_ptr<T> object)
-    {
-        RClass *found = klass;
-        const mrb_method_t copy = mrb_method_search_vm(mrb, &found, mrb_intern_lit(mrb, "initialize_copy"));
-        if (MRB_METHOD_UNDEF_P(copy) || !MRB_METHOD_FUNC_P(copy) || MRB_METHOD_FUNC(copy) != &initialize_copy) [[unlikely]]
-            throw std::logic_error("mruby::data wraps an object only in a class that mruby::data::define_class made");
-        std::unique_ptr<std::shared_ptr<T>> held = std::make_unique<std::shared_ptr<T>>(std::move(object));
-        RData *const made = mrb_data_object_alloc(mrb, klass, held.get(), &type);
-        held.release();
-        return mrb_obj_value(made);
-    }
-    static std::shared_ptr<T> get(mrb_state *const mrb, const mrb_value value)
-    {
-        const void *const p = mrb_data_check_get_ptr(mrb, value, &type);
-        return p == nullptr ? nullptr : *static_cast<const std::shared_ptr<T> *>(p);
     }
 };
 

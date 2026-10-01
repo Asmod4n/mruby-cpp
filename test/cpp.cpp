@@ -158,47 +158,6 @@ static mrb_value kept_after_m(mrb_state *mrb, mrb_value)
     return mrb_iv_get(mrb, holder, mruby::symbol<"__children__">(mrb));
 }
 
-struct counted {
-    int n = 4;
-};
-
-/* Whether a std::weak_ptr to the C++ object of a mruby::data expires once
- * the collector frees the Ruby object, and whether the type check refuses a
- * value of another type. */
-static mrb_value data_weak_expires_q(mrb_state *, mrb_value)
-{
-    const mruby::state owned;
-    mrb_state *const mrb = owned.get();
-    const int arena = mrb_gc_arena_save(mrb);
-    RClass *const holder = mruby::data<counted>::define_class(mrb, "Counted", mrb->object_class);
-    const mrb_value wrapped = mruby::data<counted>::wrap(mrb, holder, std::make_shared<counted>());
-    const std::weak_ptr<counted> watched = mruby::data<counted>::get(mrb, wrapped);
-    const bool read = !watched.expired() && watched.lock()->n == 4;
-    const bool refused = mruby::data<counted>::get(mrb, mrb_str_new_lit(mrb, "abc")) == nullptr;
-    mrb_gc_arena_restore(mrb, arena);
-    mrb_full_gc(mrb);
-    return mrb_bool_value(read && refused && watched.expired());
-}
-
-/* Makes a Counted object, the class that mruby::data::define_class makes. */
-static mrb_value counted_new_m(mrb_state *mrb, mrb_value)
-{
-    RClass *const holder = mrb_class_defined(mrb, "Counted") ? mrb_class_get(mrb, "Counted") : mruby::data<counted>::define_class(mrb, "Counted", mrb->object_class);
-    return mruby::data<counted>::wrap(mrb, holder, std::make_shared<counted>());
-}
-
-/* Whether mruby::data refuses to wrap into a class that define_class did
- * not make, where Ruby could copy the object without its C++ part. */
-static mrb_value wrap_in_other_class_throws_q(mrb_state *mrb, mrb_value)
-{
-    try {
-        mruby::data<counted>::wrap(mrb, mrb->object_class, std::make_shared<counted>());
-    } catch (const std::logic_error &) {
-        return mrb_true_value();
-    }
-    return mrb_false_value();
-}
-
 /* Whether the literal functions give back the bytes of the literal. */
 static mrb_value literals_q(mrb_state *mrb, mrb_value)
 {
@@ -220,8 +179,5 @@ extern "C" void mrb_mruby_cpp_gem_test(mrb_state *mrb)
     mrb_define_module_function(mrb, test, "kept_after", kept_after_m, MRB_ARGS_REQ(3));
     mrb_define_module_function(mrb, test, "singleton_frozen", singleton_frozen_m, MRB_ARGS_REQ(1));
     mrb_define_module_function(mrb, test, "kept_on_integer_throws?", kept_on_integer_throws_q, MRB_ARGS_NONE());
-    mrb_define_module_function(mrb, test, "counted_new", counted_new_m, MRB_ARGS_NONE());
-    mrb_define_module_function(mrb, test, "wrap_in_other_class_throws?", wrap_in_other_class_throws_q, MRB_ARGS_NONE());
-    mrb_define_module_function(mrb, test, "data_weak_expires?", data_weak_expires_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "literals?", literals_q, MRB_ARGS_NONE());
 }
