@@ -30,6 +30,9 @@ assert('mruby::frozen freezes the singleton class as freeze does') do
   assert_equal [[true, true], [false, false]], MrubyCppTest.singleton_frozen(object)
 end
 
+# A known limit: mruby::frozen thaws what it froze when it ends, also when
+# Ruby code called freeze on the object inside the scope. mruby tells
+# nobody about a freeze, so mruby::frozen cannot see one.
 assert('mruby::frozen stays frozen until the outer one ends') do
   text = 'abc'
   assert_true MrubyCppTest.frozen_after_inner?(text)
@@ -66,27 +69,36 @@ assert('mruby::protect gives a raise back as a value') do
   assert_true MrubyCppTest.protect_returns_raise?
 end
 
+# mrb_protect_error sets mrb->jmp for the time of the call. A C++ exception
+# that passes through it leaves mrb->jmp pointing at a frame that is gone,
+# and the next raise jumps there. mruby::protect carries the exception past
+# mrb_protect_error and throws it again after, because only the C++ code
+# that threw it can repair the cause.
+assert('mruby::protect gives a C++ exception back as itself') do
+  assert_true MrubyCppTest.protect_rethrows_cxx_exception?
+end
+
 # A value that a C++ object keeps lives on its Ruby holder, under the name
 # of the C++ field, where Ruby cannot reach it. Each operation mirrors what
 # C++ does with the field.
-assert('mruby::kept mirrors the field of a C++ object') do
+assert('mruby::instance_variable mirrors the field of a C++ object') do
   holder = Object.new
   first = 'a'
   second = 'b'
-  assert_equal first, MrubyCppTest.kept_after(holder, :assign, first)
+  assert_equal first, MrubyCppTest.instance_variable_after(holder, :assign, first)
   assert_equal [], holder.instance_variables
   holder = Object.new
-  assert_equal [first], MrubyCppTest.kept_after(holder, :push_back, first)
-  assert_equal [first, second], MrubyCppTest.kept_after(holder, :push_back, second)
-  assert_equal [second], MrubyCppTest.kept_after(holder, :erase, first)
-  assert_nil MrubyCppTest.kept_after(holder, :clear, nil)
+  assert_equal [first], MrubyCppTest.instance_variable_after(holder, :push_back, first)
+  assert_equal [first, second], MrubyCppTest.instance_variable_after(holder, :push_back, second)
+  assert_equal [second], MrubyCppTest.instance_variable_after(holder, :erase, first)
+  assert_nil MrubyCppTest.instance_variable_after(holder, :clear, nil)
   # The ivar is bookkeeping of the C++ field and not a change the user
   # made, so it works on a holder the user froze, which stays frozen.
   frozen = Object.new.freeze
-  assert_equal [first], MrubyCppTest.kept_after(frozen, :push_back, first)
+  assert_equal [first], MrubyCppTest.instance_variable_after(frozen, :push_back, first)
   assert_true frozen.frozen?
-  assert_nil MrubyCppTest.kept_after(Object.new, :erase, first)
-  assert_true MrubyCppTest.kept_on_integer_throws?
+  assert_nil MrubyCppTest.instance_variable_after(Object.new, :erase, first)
+  assert_true MrubyCppTest.instance_variable_on_integer_throws?
 end
 
 # mrb_intern_static and mrb_str_new_static keep the pointer they are given,

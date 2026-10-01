@@ -5,10 +5,13 @@
 #include <mruby/error.h>
 #include <mruby/proc.h>
 #include <mruby/string.h>
+#include <mruby/throw.h>
 #include <mruby/value.h>
 #include <mruby/variable.h>
 
 #include <cstddef>
+#include <exception>
+#include <experimental/scope>
 #include <expected>
 #include <memory>
 #include <algorithm>
@@ -73,16 +76,15 @@ inline frozen::frozen(mrb_state *const mrb, const automatic &given) { freeze(mrb
 template <class F>
 std::expected<mrb_value, mrb_value> protect(mrb_state *mrb, F &&body);
 
-struct life {
-    mrb_state *mrb = nullptr;
-    std::thread::id owner = std::this_thread::get_id();
-    std::mutex lock;
-    std::vector<mrb_value> released;
-    std::unordered_set<mrb_value *> roots;
-};
-
 class state {
-    std::shared_ptr<life> shared = std::make_shared<life>();
+    struct owned {
+        mrb_state *mrb = nullptr;
+        std::thread::id owner = std::this_thread::get_id();
+        std::mutex lock;
+        std::vector<mrb_value> released;
+        std::unordered_set<mrb_value *> roots;
+    };
+    std::shared_ptr<owned> shared = std::make_shared<owned>();
 
 public:
     state()
@@ -109,7 +111,7 @@ public:
 
 inline std::shared_ptr<const mrb_value> root(const state &owner, const automatic &value)
 {
-    const std::shared_ptr<life> &shared = owner.shared;
+    const std::shared_ptr<state::owned> &shared = owner.shared;
     if (std::this_thread::get_id() != shared->owner) [[unlikely]]
         throw std::logic_error("a thread tries to root a value of an mrb_state that another thread owns");
     std::vector<mrb_value> released;
@@ -137,8 +139,8 @@ inline std::shared_ptr<const mrb_value> root(const state &owner, const automatic
         mrb_gc_unregister(shared->mrb, registered);
         throw;
     }
-    return std::shared_ptr<const mrb_value>(cell.release(), [watched = std::weak_ptr<life>(shared)](const mrb_value *const p) {
-        if (const std::shared_ptr<life> alive = watched.lock(); alive != nullptr) {
+    return std::shared_ptr<const mrb_value>(cell.release(), [watched = std::weak_ptr<state::owned>(shared)](const mrb_value *const p) {
+        if (const std::shared_ptr<state::owned> alive = watched.lock(); alive != nullptr) {
             const std::scoped_lock hold(alive->lock);
             if (alive->roots.erase(const_cast<mrb_value *>(p)) != 0) alive->released.push_back(*p);
         }
@@ -149,32 +151,42 @@ inline std::shared_ptr<const mrb_value> root(const state &owner, const automatic
 template <class F>
 std::expected<mrb_value, mrb_value> protect(mrb_state *const mrb, F &&body)
 {
+    struct call {
+        std::remove_reference_t<F> *body;
+        std::exception_ptr thrown;
+    };
+    call made{&body, nullptr};
     mrb_bool error = false;
     const mrb_value answer = mrb_protect_error(
-        mrb, [](mrb_state *const state, void *const given) -> mrb_value { return (*static_cast<std::remove_reference_t<F> *>(given))(state); }, &body, &error);
+        mrb,
+        [](mrb_state *const state, void *const given) -> mrb_value {
+            call *const c = static_cast<call *>(given);
+            try {
+                return (*c->body)(state);
+            } catch (mrb_jmpbuf *) {
+                throw;
+            } catch (...) {
+                c->thrown = std::current_exception();
+                return mrb_nil_value();
+            }
+        },
+        &made, &error);
+    if (made.thrown) [[unlikely]] std::rethrow_exception(made.thrown);
     if (error) [[unlikely]] return std::unexpected(answer);
     return answer;
 }
 
-class kept {
+class instance_variable {
     mrb_state *mrb;
     mrb_value holder;
     mrb_sym name;
 
-    class thawed {
-        RBasic *object;
-        bool frozen;
-
-    public:
-        explicit thawed(const mrb_value given) : object(mrb_basic_ptr(given)), frozen(mrb_frozen_p(object)) { object->frozen = 0; }
-        thawed(const thawed &) = delete;
-        thawed &operator=(const thawed &) = delete;
-        ~thawed() { object->frozen = frozen; }
-    };
-
     void set(const mrb_value value)
     {
-        const thawed open(holder);
+        RBasic *const object = mrb_basic_ptr(holder);
+        const bool was = mrb_frozen_p(object);
+        object->frozen = 0;
+        const std::experimental::scope_exit refreeze([object, was] { object->frozen = was; });
         mrb_iv_set(mrb, holder, name, value);
     }
     mrb_value list()
@@ -187,12 +199,12 @@ class kept {
     }
 
 public:
-    kept(mrb_state *const given, const mrb_value owner, const std::string_view field)
+    instance_variable(mrb_state *const given, const mrb_value owner, const std::string_view field)
         : mrb(given), holder(owner), name(mrb_intern_cstr(given, ("__" + std::string(field) + "__").c_str()))
     {
         constexpr std::array holders{MRB_TT_OBJECT, MRB_TT_CLASS, MRB_TT_MODULE, MRB_TT_SCLASS, MRB_TT_HASH, MRB_TT_CDATA, MRB_TT_EXCEPTION};
         if (mrb_immediate_p(owner) || !std::ranges::contains(holders, mrb_type(owner))) [[unlikely]]
-            throw std::logic_error("mruby::kept keeps a value only on an object that has instance variables");
+            throw std::logic_error("mruby::instance_variable keeps a value only on an object that has instance variables");
     }
     void assign(const mrb_value value) { set(value); }
     void push_back(const mrb_value value) { mrb_ary_push(mrb, list(), value); }
@@ -206,7 +218,10 @@ public:
     }
     void clear()
     {
-        const thawed open(holder);
+        RBasic *const object = mrb_basic_ptr(holder);
+        const bool was = mrb_frozen_p(object);
+        object->frozen = 0;
+        const std::experimental::scope_exit refreeze([object, was] { object->frozen = was; });
         mrb_iv_remove(mrb, holder, name);
     }
 };

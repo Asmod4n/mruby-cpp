@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 
 /* Whether the value is frozen while a mruby::frozen exists. */
 static mrb_value frozen_while_held_q(mrb_state *mrb, mrb_value)
@@ -63,11 +64,11 @@ static mrb_value singleton_frozen_m(mrb_state *mrb, mrb_value)
     return mrb_assoc_new(mrb, during, mrb_assoc_new(mrb, mrb_bool_value(mrb_frozen_p(object)), mrb_bool_value(mrb_frozen_p(object->c))));
 }
 
-/* Whether mruby::kept refuses a holder that has no instance variables. */
-static mrb_value kept_on_integer_throws_q(mrb_state *mrb, mrb_value)
+/* Whether mruby::instance_variable refuses a holder that has no instance variables. */
+static mrb_value instance_variable_on_integer_throws_q(mrb_state *mrb, mrb_value)
 {
     try {
-        mruby::kept field(mrb, mrb_fixnum_value(1), "children");
+        mruby::instance_variable field(mrb, mrb_fixnum_value(1), "children");
     } catch (const std::logic_error &) {
         return mrb_true_value();
     }
@@ -137,19 +138,36 @@ static mrb_value protect_returns_raise_q(mrb_state *, mrb_value)
 {
     const mruby::state owned;
     mrb_state *const mrb = owned.get();
-    const auto raised = mruby::protect(mrb, [](mrb_state *const mrb) -> mrb_value { mrb_raise(mrb, E_ARGUMENT_ERROR, "raised"); });
+    const auto raised = mruby::protect(mrb, [](mrb_state *const mrb) -> mrb_value { mrb_raise(mrb, E_ARGUMENT_ERROR, "raised"); std::unreachable(); });
     const auto answered = mruby::protect(mrb, [](mrb_state *) { return mrb_fixnum_value(3); });
     return mrb_bool_value(!raised && mrb_obj_is_kind_of(mrb, raised.error(), E_ARGUMENT_ERROR) && answered && mrb_fixnum(*answered) == 3);
 }
 
-/* Applies one operation of mruby::kept to the holder, and answers what the
+/* Whether a C++ exception thrown inside mruby::protect leaves it as the same
+ * C++ exception, and whether the state still runs Ruby afterwards. */
+static mrb_value protect_rethrows_cxx_exception_q(mrb_state *, mrb_value)
+{
+    const mruby::state owned;
+    mrb_state *const mrb = owned.get();
+    bool caught = false;
+    try {
+        mruby::protect(mrb, [](mrb_state *) -> mrb_value { throw std::out_of_range("thrown"); });
+    } catch (const std::out_of_range &) {
+        caught = true;
+    }
+    const auto raised = mruby::protect(mrb, [](mrb_state *const mrb) -> mrb_value { mrb_raise(mrb, E_ARGUMENT_ERROR, "raised"); std::unreachable(); });
+    const auto answered = mruby::protect(mrb, [](mrb_state *const mrb) { return mrb_funcall(mrb, mrb_fixnum_value(1), "+", 1, mrb_fixnum_value(2)); });
+    return mrb_bool_value(caught && !raised && answered && mrb_fixnum(*answered) == 3);
+}
+
+/* Applies one operation of mruby::instance_variable to the holder, and answers what the
  * hidden instance variable holds afterwards. */
-static mrb_value kept_after_m(mrb_state *mrb, mrb_value)
+static mrb_value instance_variable_after_m(mrb_state *mrb, mrb_value)
 {
     mrb_value holder, value;
     mrb_sym how;
     mrb_get_args(mrb, "ono", &holder, &how, &value);
-    mruby::kept field(mrb, holder, "children");
+    mruby::instance_variable field(mrb, holder, "children");
     const std::string_view operation = mrb_sym_name(mrb, how);
     if (operation == "assign") field.assign(value);
     else if (operation == "push_back") field.push_back(value);
@@ -176,8 +194,9 @@ extern "C" void mrb_mruby_cpp_gem_test(mrb_state *mrb)
     mrb_define_module_function(mrb, test, "released_root_is_collected?", released_root_is_collected_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "root_after_close_is_nil?", root_after_close_is_nil_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "protect_returns_raise?", protect_returns_raise_q, MRB_ARGS_NONE());
-    mrb_define_module_function(mrb, test, "kept_after", kept_after_m, MRB_ARGS_REQ(3));
+    mrb_define_module_function(mrb, test, "protect_rethrows_cxx_exception?", protect_rethrows_cxx_exception_q, MRB_ARGS_NONE());
+    mrb_define_module_function(mrb, test, "instance_variable_after", instance_variable_after_m, MRB_ARGS_REQ(3));
     mrb_define_module_function(mrb, test, "singleton_frozen", singleton_frozen_m, MRB_ARGS_REQ(1));
-    mrb_define_module_function(mrb, test, "kept_on_integer_throws?", kept_on_integer_throws_q, MRB_ARGS_NONE());
+    mrb_define_module_function(mrb, test, "instance_variable_on_integer_throws?", instance_variable_on_integer_throws_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "literals?", literals_q, MRB_ARGS_NONE());
 }
