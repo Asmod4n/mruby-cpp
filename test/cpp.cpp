@@ -1,65 +1,60 @@
 #include <mruby.h>
-#include <mruby/string.h>
+#include <mruby/array.h>
+#include <mruby/class.h>
 #include <mruby/gc.h>
+#include <mruby/string.h>
+#include <mruby/variable.h>
 #include <mruby/cpp.hpp>
 
-#include <mutex>
+#include <memory>
 #include <stdexcept>
-#include <thread>
+#include <string_view>
 #include <type_traits>
 
-/* Whether the value is frozen while a std::scoped_lock holds it. */
-static mrb_value frozen_while_locked_q(mrb_state *mrb, mrb_value)
+/* Whether the value is frozen while a mruby::frozen exists. */
+static mrb_value frozen_while_held_q(mrb_state *mrb, mrb_value)
 {
     mrb_value given;
     mrb_get_args(mrb, "o", &given);
-    mruby::value held(given);
-    const std::scoped_lock hold(held);
+    const mruby::frozen held(given);
     return mrb_bool_value(!mrb_immediate_p(given) && mrb_frozen_p(mrb_basic_ptr(given)));
 }
 
-/* Appends to a String while a std::scoped_lock holds it. */
-static mrb_value append_while_locked(mrb_state *mrb, mrb_value)
+/* Appends to a String while a mruby::frozen holds it. */
+static mrb_value append_while_frozen(mrb_state *mrb, mrb_value)
 {
     mrb_value given;
     mrb_get_args(mrb, "S", &given);
-    mruby::value held(given);
-    const std::scoped_lock hold(held);
+    const mruby::frozen held(given);
     mrb_str_cat_lit(mrb, given, "x");
     return given;
 }
 
-/* Whether the value is still frozen after the inner of two locks of one
- * mruby::value ended. */
-static mrb_value frozen_after_inner_lock_q(mrb_state *mrb, mrb_value)
+/* Whether the value is still frozen after the inner of two mruby::frozen of
+ * one object ended. */
+static mrb_value frozen_after_inner_q(mrb_state *mrb, mrb_value)
 {
     mrb_value given;
     mrb_get_args(mrb, "o", &given);
-    mruby::value held(given);
-    const std::scoped_lock outer(held);
+    const mruby::frozen outer(given);
     {
-        const std::scoped_lock inner(held);
+        const mruby::frozen inner(given);
     }
     return mrb_bool_value(mrb_frozen_p(mrb_basic_ptr(given)));
 }
 
-/* Whether a lock from a thread other than the one that made the
- * mruby::value throws std::logic_error. */
-static mrb_value lock_from_other_thread_throws_q(mrb_state *mrb, mrb_value)
+template <class T>
+concept made_with_new = requires { new T(mrb_nil_value()); };
+
+/* Whether mruby::frozen and mruby::automatic refuse every way out of the
+ * scope that made them: a copy, a move and new. */
+static mrb_value scope_bound_q(mrb_state *, mrb_value)
 {
-    mrb_value given;
-    mrb_get_args(mrb, "o", &given);
-    mruby::value held(given);
-    bool thrown = false;
-    std::thread other([&] {
-        try {
-            held.lock();
-        } catch (const std::logic_error &) {
-            thrown = true;
-        }
-    });
-    other.join();
-    return mrb_bool_value(thrown && !mrb_frozen_p(mrb_basic_ptr(given)));
+    constexpr bool answered = !std::is_copy_constructible_v<mruby::frozen> && !std::is_move_constructible_v<mruby::frozen> &&
+                              !made_with_new<mruby::frozen> && !std::is_copy_constructible_v<mruby::automatic> &&
+                              !std::is_move_constructible_v<mruby::automatic> && !std::is_copy_assignable_v<mruby::automatic> &&
+                              !made_with_new<mruby::automatic>;
+    return mrb_bool_value(answered);
 }
 
 /* Whether a String that only a root holds survives a full collection in
@@ -105,27 +100,79 @@ static mrb_value root_after_close_is_nil_q(mrb_state *, mrb_value)
     return mrb_bool_value(nil);
 }
 
-template <class T>
-concept made_with_new = requires { new T(mrb_nil_value()); };
-
-/* Whether an automatic value refuses every way out of the call that made
- * it: a copy, a move and new. */
-static mrb_value automatic_cannot_escape_q(mrb_state *, mrb_value)
+/* Whether a raise in a state that C++ owns, where no Ruby frame is above,
+ * comes back as a value, and a plain answer comes back as the answer. */
+static mrb_value protect_returns_raise_q(mrb_state *, mrb_value)
 {
-    constexpr bool answered = !std::is_copy_constructible_v<mruby::automatic> && !std::is_move_constructible_v<mruby::automatic> &&
-                              !std::is_copy_assignable_v<mruby::automatic> && !made_with_new<mruby::automatic>;
-    return mrb_bool_value(answered);
+    const mruby::state owned;
+    mrb_state *const mrb = owned.get();
+    const auto raised = mruby::protect(mrb, [](mrb_state *const mrb) -> mrb_value { mrb_raise(mrb, E_ARGUMENT_ERROR, "raised"); });
+    const auto answered = mruby::protect(mrb, [](mrb_state *) { return mrb_fixnum_value(3); });
+    return mrb_bool_value(!raised && mrb_obj_is_kind_of(mrb, raised.error(), E_ARGUMENT_ERROR) && answered && mrb_fixnum(*answered) == 3);
+}
+
+static mrb_value throws_runtime_error(mrb_state *, mrb_value)
+{
+    throw std::runtime_error("thrown in C++");
+}
+
+/* Applies one operation of mruby::kept to the holder, and answers what the
+ * hidden instance variable holds afterwards. */
+static mrb_value kept_after_m(mrb_state *mrb, mrb_value)
+{
+    mrb_value holder, value;
+    mrb_sym how;
+    mrb_get_args(mrb, "ono", &holder, &how, &value);
+    mruby::kept field(mrb, holder, "children");
+    const std::string_view operation = mrb_sym_name(mrb, how);
+    if (operation == "assign") field.assign(value);
+    else if (operation == "push_back") field.push_back(value);
+    else if (operation == "erase") field.erase(value);
+    else field.clear();
+    return mrb_iv_get(mrb, holder, mruby::symbol<"__children__">(mrb));
+}
+
+struct counted {
+    int n = 4;
+};
+
+/* Whether a std::weak_ptr to the C++ object of a mruby::data expires once
+ * the collector frees the Ruby object, and whether the type check refuses a
+ * value of another type. */
+static mrb_value data_weak_expires_q(mrb_state *, mrb_value)
+{
+    const mruby::state owned;
+    mrb_state *const mrb = owned.get();
+    const int arena = mrb_gc_arena_save(mrb);
+    const mrb_value wrapped = mruby::data<counted>::wrap(mrb, mrb->object_class, std::make_shared<counted>());
+    const std::weak_ptr<counted> watched = mruby::data<counted>::get(mrb, wrapped);
+    const bool read = !watched.expired() && watched.lock()->n == 4;
+    const bool refused = mruby::data<counted>::get(mrb, mrb_str_new_lit(mrb, "abc")) == nullptr;
+    mrb_gc_arena_restore(mrb, arena);
+    mrb_full_gc(mrb);
+    return mrb_bool_value(read && refused && watched.expired());
+}
+
+/* Whether the literal functions give back the bytes of the literal. */
+static mrb_value literals_q(mrb_state *mrb, mrb_value)
+{
+    const mrb_value text = mruby::str_new_static<"abc">(mrb);
+    return mrb_bool_value(mruby::symbol<"abc">(mrb) == mrb_intern_lit(mrb, "abc") && RSTRING_LEN(text) == 3);
 }
 
 extern "C" void mrb_mruby_cpp_gem_test(mrb_state *mrb)
 {
     RClass *const test = mrb_define_module(mrb, "MrubyCppTest");
-    mrb_define_module_function(mrb, test, "frozen_while_locked?", frozen_while_locked_q, MRB_ARGS_REQ(1));
-    mrb_define_module_function(mrb, test, "append_while_locked", append_while_locked, MRB_ARGS_REQ(1));
-    mrb_define_module_function(mrb, test, "frozen_after_inner_lock?", frozen_after_inner_lock_q, MRB_ARGS_REQ(1));
-    mrb_define_module_function(mrb, test, "lock_from_other_thread_throws?", lock_from_other_thread_throws_q, MRB_ARGS_REQ(1));
+    mrb_define_module_function(mrb, test, "frozen_while_held?", frozen_while_held_q, MRB_ARGS_REQ(1));
+    mrb_define_module_function(mrb, test, "append_while_frozen", append_while_frozen, MRB_ARGS_REQ(1));
+    mrb_define_module_function(mrb, test, "frozen_after_inner?", frozen_after_inner_q, MRB_ARGS_REQ(1));
+    mrb_define_module_function(mrb, test, "scope_bound?", scope_bound_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "root_keeps_value?", root_keeps_value_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "released_root_is_collected?", released_root_is_collected_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "root_after_close_is_nil?", root_after_close_is_nil_q, MRB_ARGS_NONE());
-    mrb_define_module_function(mrb, test, "automatic_cannot_escape?", automatic_cannot_escape_q, MRB_ARGS_NONE());
+    mrb_define_module_function(mrb, test, "protect_returns_raise?", protect_returns_raise_q, MRB_ARGS_NONE());
+    mrb_define_module_function(mrb, test, "throws_runtime_error", mruby::method<throws_runtime_error>, MRB_ARGS_NONE());
+    mrb_define_module_function(mrb, test, "kept_after", kept_after_m, MRB_ARGS_REQ(3));
+    mrb_define_module_function(mrb, test, "data_weak_expires?", data_weak_expires_q, MRB_ARGS_NONE());
+    mrb_define_module_function(mrb, test, "literals?", literals_q, MRB_ARGS_NONE());
 }
