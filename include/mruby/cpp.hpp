@@ -10,8 +10,6 @@
 #include <mruby/variable.h>
 
 #include <cstddef>
-#include <exception>
-#include <system_error>
 #include <expected>
 #include <memory>
 #include <algorithm>
@@ -155,45 +153,6 @@ std::expected<mrb_value, mrb_value> protect(mrb_state *const mrb, F &&body)
         mrb, [](mrb_state *const state, void *const given) -> mrb_value { return (*static_cast<std::remove_reference_t<F> *>(given))(state); }, &body, &error);
     if (error) [[unlikely]] return std::unexpected(answer);
     return answer;
-}
-
-template <mrb_value (*Function)(mrb_state *, mrb_value)>
-mrb_value method(mrb_state *const mrb, const mrb_value self)
-{
-    RClass *raised = nullptr;
-    mrb_value message = mrb_nil_value();
-    try {
-        return Function(mrb, self);
-    } catch (void *) {
-        throw;
-    } catch (const std::bad_alloc &) {
-        mrb_exc_raise(mrb, mrb_obj_value(mrb->nomem_err));
-    } catch (const std::invalid_argument &thrown) {
-        raised = E_ARGUMENT_ERROR;
-        message = mrb_str_new_cstr(mrb, thrown.what());
-    } catch (const std::length_error &thrown) {
-        raised = E_ARGUMENT_ERROR;
-        message = mrb_str_new_cstr(mrb, thrown.what());
-    } catch (const std::out_of_range &thrown) {
-        raised = E_INDEX_ERROR;
-        message = mrb_str_new_cstr(mrb, thrown.what());
-    } catch (const std::range_error &thrown) {
-        raised = E_RANGE_ERROR;
-        message = mrb_str_new_cstr(mrb, thrown.what());
-    } catch (const std::overflow_error &thrown) {
-        raised = E_RANGE_ERROR;
-        message = mrb_str_new_cstr(mrb, thrown.what());
-    } catch (const std::underflow_error &thrown) {
-        raised = E_RANGE_ERROR;
-        message = mrb_str_new_cstr(mrb, thrown.what());
-    } catch (const std::exception &thrown) {
-        raised = E_RUNTIME_ERROR;
-        message = mrb_str_new_cstr(mrb, thrown.what());
-    } catch (...) {
-        raised = E_RUNTIME_ERROR;
-        message = mrb_str_new_lit(mrb, "C++ threw a value that is not a std::exception");
-    }
-    mrb_exc_raise(mrb, mrb_exc_new_str(mrb, raised, message));
 }
 
 class kept {

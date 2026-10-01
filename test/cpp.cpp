@@ -114,31 +114,6 @@ static mrb_value protect_returns_raise_q(mrb_state *, mrb_value)
     return mrb_bool_value(!raised && mrb_obj_is_kind_of(mrb, raised.error(), E_ARGUMENT_ERROR) && answered && mrb_fixnum(*answered) == 3);
 }
 
-static mrb_value throws_runtime_error(mrb_state *, mrb_value)
-{
-    throw std::runtime_error("thrown in C++");
-}
-
-static mrb_value throws_invalid_argument(mrb_state *, mrb_value)
-{
-    throw std::invalid_argument("not a valid argument");
-}
-
-static mrb_value throws_out_of_range(mrb_state *, mrb_value)
-{
-    throw std::out_of_range("index 9 is out of range");
-}
-
-static mrb_value throws_bad_alloc(mrb_state *, mrb_value)
-{
-    throw std::bad_alloc();
-}
-
-static mrb_value throws_int(mrb_state *, mrb_value)
-{
-    throw 3;
-}
-
 /* Applies one operation of mruby::kept to the holder, and answers what the
  * hidden instance variable holds afterwards. */
 static mrb_value kept_after_m(mrb_state *mrb, mrb_value)
@@ -214,12 +189,7 @@ extern "C" void mrb_mruby_cpp_gem_test(mrb_state *mrb)
     mrb_define_module_function(mrb, test, "released_root_is_collected?", released_root_is_collected_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "root_after_close_is_nil?", root_after_close_is_nil_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "protect_returns_raise?", protect_returns_raise_q, MRB_ARGS_NONE());
-    mrb_define_module_function(mrb, test, "throws_runtime_error", mruby::method<throws_runtime_error>, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "kept_after", kept_after_m, MRB_ARGS_REQ(3));
-    mrb_define_module_function(mrb, test, "throws_invalid_argument", mruby::method<throws_invalid_argument>, MRB_ARGS_NONE());
-    mrb_define_module_function(mrb, test, "throws_out_of_range", mruby::method<throws_out_of_range>, MRB_ARGS_NONE());
-    mrb_define_module_function(mrb, test, "throws_bad_alloc", mruby::method<throws_bad_alloc>, MRB_ARGS_NONE());
-    mrb_define_module_function(mrb, test, "throws_int", mruby::method<throws_int>, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "counted_new", counted_new_m, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "wrap_in_other_class_throws?", wrap_in_other_class_throws_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "data_weak_expires?", data_weak_expires_q, MRB_ARGS_NONE());

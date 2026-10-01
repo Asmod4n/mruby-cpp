@@ -58,23 +58,6 @@ assert('mruby::protect gives a raise back as a value') do
   assert_true MrubyCppTest.protect_returns_raise?
 end
 
-# A C++ exception that passes through mruby frames leaves mruby with a
-# handler that no longer exists. mruby::method turns it into a raise at the
-# boundary.
-assert('mruby::method turns a C++ exception into a raise') do
-  error = assert_raise(RuntimeError) { MrubyCppTest.throws_runtime_error }
-  assert_equal 'thrown in C++', error.message
-end
-
-# A C++ exception becomes the class that plain mruby raises for the same
-# fault, so Ruby code rescues it the way it rescues any other.
-assert('mruby::method raises the mruby class for each C++ exception') do
-  assert_raise(ArgumentError) { MrubyCppTest.throws_invalid_argument }
-  assert_raise(IndexError) { MrubyCppTest.throws_out_of_range }
-  assert_raise(NoMemoryError) { MrubyCppTest.throws_bad_alloc }
-  assert_raise(RuntimeError) { MrubyCppTest.throws_int }
-end
-
 # dup and clone copy the instance variables of a data object, and not the
 # C++ object. Nobody can know whether a copy of the C++ object is safe.
 assert('a mruby::data object refuses dup and clone') do
