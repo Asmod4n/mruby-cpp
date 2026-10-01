@@ -1,14 +1,17 @@
 #pragma once
 #include <mruby.h>
 #include <mruby/array.h>
+#include <mruby/class.h>
 #include <mruby/data.h>
 #include <mruby/error.h>
+#include <mruby/proc.h>
 #include <mruby/string.h>
 #include <mruby/value.h>
 #include <mruby/variable.h>
 
 #include <cstddef>
 #include <exception>
+#include <system_error>
 #include <expected>
 #include <memory>
 #include <algorithm>
@@ -27,18 +30,23 @@
 
 namespace mruby {
 
+class automatic;
+
 class frozen {
     RBasic *object = nullptr;
     bool thaws = false;
 
-public:
-    explicit frozen(const mrb_value given)
+    void freeze(const mrb_value given)
     {
         if (mrb_immediate_p(given)) return;
         object = mrb_basic_ptr(given);
         thaws = !mrb_frozen_p(object);
         object->frozen = 1;
     }
+
+public:
+    explicit frozen(const automatic &given);
+    explicit frozen(const std::shared_ptr<const mrb_value> &given) { freeze(*given); }
     frozen(const frozen &) = delete;
     frozen &operator=(const frozen &) = delete;
     static void *operator new(std::size_t) = delete;
@@ -60,6 +68,11 @@ public:
     static void *operator new[](std::size_t) = delete;
     operator mrb_value() const { return object; }
 };
+
+inline frozen::frozen(const automatic &given) { freeze(given); }
+
+template <class F>
+std::expected<mrb_value, mrb_value> protect(mrb_state *mrb, F &&body);
 
 struct life {
     mrb_state *mrb = nullptr;
@@ -107,12 +120,22 @@ inline std::shared_ptr<const mrb_value> root(const state &owner, const automatic
     }
     for (const mrb_value v : released) mrb_gc_unregister(shared->mrb, v);
     std::unique_ptr<mrb_value> cell = std::make_unique<mrb_value>(value);
-    mrb_gc_register(shared->mrb, *cell);
+    const mrb_value registered = *cell;
+    if (!protect(shared->mrb, [registered](mrb_state *const mrb) {
+            mrb_gc_register(mrb, registered);
+            return mrb_nil_value();
+        })) [[unlikely]]
+        throw std::bad_alloc();
     try {
         const std::scoped_lock hold(shared->lock);
         shared->roots.insert(cell.get());
+        shared->released.reserve(shared->released.size() + shared->roots.size());
     } catch (const std::bad_alloc &) {
-        mrb_gc_unregister(shared->mrb, *cell);
+        {
+            const std::scoped_lock hold(shared->lock);
+            shared->roots.erase(cell.get());
+        }
+        mrb_gc_unregister(shared->mrb, registered);
         throw;
     }
     return std::shared_ptr<const mrb_value>(cell.release(), [watched = std::weak_ptr<life>(shared)](const mrb_value *const p) {
@@ -137,13 +160,40 @@ std::expected<mrb_value, mrb_value> protect(mrb_state *const mrb, F &&body)
 template <mrb_value (*Function)(mrb_state *, mrb_value)>
 mrb_value method(mrb_state *const mrb, const mrb_value self)
 {
+    RClass *raised = nullptr;
     mrb_value message = mrb_nil_value();
     try {
         return Function(mrb, self);
-    } catch (const std::exception &thrown) {
+    } catch (void *) {
+        throw;
+    } catch (const std::bad_alloc &) {
+        mrb_exc_raise(mrb, mrb_obj_value(mrb->nomem_err));
+    } catch (const std::invalid_argument &thrown) {
+        raised = E_ARGUMENT_ERROR;
         message = mrb_str_new_cstr(mrb, thrown.what());
+    } catch (const std::length_error &thrown) {
+        raised = E_ARGUMENT_ERROR;
+        message = mrb_str_new_cstr(mrb, thrown.what());
+    } catch (const std::out_of_range &thrown) {
+        raised = E_INDEX_ERROR;
+        message = mrb_str_new_cstr(mrb, thrown.what());
+    } catch (const std::range_error &thrown) {
+        raised = E_RANGE_ERROR;
+        message = mrb_str_new_cstr(mrb, thrown.what());
+    } catch (const std::overflow_error &thrown) {
+        raised = E_RANGE_ERROR;
+        message = mrb_str_new_cstr(mrb, thrown.what());
+    } catch (const std::underflow_error &thrown) {
+        raised = E_RANGE_ERROR;
+        message = mrb_str_new_cstr(mrb, thrown.what());
+    } catch (const std::exception &thrown) {
+        raised = E_RUNTIME_ERROR;
+        message = mrb_str_new_cstr(mrb, thrown.what());
+    } catch (...) {
+        raised = E_RUNTIME_ERROR;
+        message = mrb_str_new_lit(mrb, "C++ threw a value that is not a std::exception");
     }
-    mrb_exc_raise(mrb, mrb_exc_new_str(mrb, E_RUNTIME_ERROR, message));
+    mrb_exc_raise(mrb, mrb_exc_new_str(mrb, raised, message));
 }
 
 class kept {
@@ -178,10 +228,26 @@ public:
 };
 
 template <class T>
+    requires std::is_nothrow_destructible_v<T>
 struct data {
     inline static const mrb_data_type type{typeid(T).name(), [](mrb_state *, void *const p) { delete static_cast<std::shared_ptr<T> *>(p); }};
+    static mrb_value initialize_copy(mrb_state *const mrb, const mrb_value self)
+    {
+        mrb_raisef(mrb, E_NOTIMP_ERROR, "%C holds a C++ object, and a copy of it is not known to be safe", mrb_obj_class(mrb, self));
+    }
+    static RClass *define_class(mrb_state *const mrb, const char *const name, RClass *const super)
+    {
+        RClass *const made = mrb_define_class(mrb, name, super);
+        MRB_SET_INSTANCE_TT(made, MRB_TT_CDATA);
+        mrb_define_method(mrb, made, "initialize_copy", initialize_copy, MRB_ARGS_REQ(1));
+        return made;
+    }
     static mrb_value wrap(mrb_state *const mrb, RClass *const klass, std::shared_ptr<T> object)
     {
+        RClass *found = klass;
+        const mrb_method_t copy = mrb_method_search_vm(mrb, &found, mrb_intern_lit(mrb, "initialize_copy"));
+        if (MRB_METHOD_UNDEF_P(copy) || !MRB_METHOD_FUNC_P(copy) || MRB_METHOD_FUNC(copy) != &initialize_copy) [[unlikely]]
+            throw std::logic_error("mruby::data wraps an object only in a class that mruby::data::define_class made");
         std::unique_ptr<std::shared_ptr<T>> held = std::make_unique<std::shared_ptr<T>>(std::move(object));
         RData *const made = mrb_data_object_alloc(mrb, klass, held.get(), &type);
         held.release();

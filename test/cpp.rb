@@ -66,6 +66,24 @@ assert('mruby::method turns a C++ exception into a raise') do
   assert_equal 'thrown in C++', error.message
 end
 
+# A C++ exception becomes the class that plain mruby raises for the same
+# fault, so Ruby code rescues it the way it rescues any other.
+assert('mruby::method raises the mruby class for each C++ exception') do
+  assert_raise(ArgumentError) { MrubyCppTest.throws_invalid_argument }
+  assert_raise(IndexError) { MrubyCppTest.throws_out_of_range }
+  assert_raise(NoMemoryError) { MrubyCppTest.throws_bad_alloc }
+  assert_raise(RuntimeError) { MrubyCppTest.throws_int }
+end
+
+# dup and clone copy the instance variables of a data object, and not the
+# C++ object. Nobody can know whether a copy of the C++ object is safe.
+assert('a mruby::data object refuses dup and clone') do
+  counted = MrubyCppTest.counted_new
+  assert_raise(NotImplementedError) { counted.dup }
+  assert_raise(NotImplementedError) { counted.clone }
+  assert_true MrubyCppTest.wrap_in_other_class_throws?
+end
+
 # A value that a C++ object keeps lives on its Ruby holder, under the name
 # of the C++ field, where Ruby cannot reach it. Each operation mirrors what
 # C++ does with the field.
