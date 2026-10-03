@@ -213,26 +213,46 @@ static mrb_value literals_q(mrb_state *mrb, mrb_value)
 }
 
 
-/* Takes a view of a String through a const mruby::RString and a copy
- * through a mutable one, changes the String in three ways, runs a full GC,
- * and answers whether the view and the copy kept the first bytes. */
-static mrb_value string_view_after_change_m(mrb_state *, mrb_value)
+/* Makes one object of each type, runs a full GC, and answers whether each
+ * one still reads what it was made with: the arena holds each wrapper, as
+ * mrb_funcall holds its answer, and the wrapper holds the object. */
+static mrb_value objects_survive_gc_q(mrb_state *, mrb_value)
 {
     mruby::state owned;
-    mrb_state *const mrb = owned.get();
-    const std::string_view first = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz";
-    const mrb_value text = mrb_str_new(mrb, first.data(), static_cast<mrb_int>(first.size()));
-    const mruby::automatic argument(text);
-    const mruby::RString viewed = owned.ensure_string_type(argument);
-    mruby::RString copied = owned.ensure_string_type(argument);
-    const std::string_view view = viewed.bytes();
-    const std::string copy = copied.bytes();
-    mrb_str_cat_lit(mrb, text, "appended");
-    mrb_funcall(mrb, text, "upcase!", 0);
-    mrb_funcall(mrb, text, "replace", 1, mrb_str_new_lit(mrb, "other"));
-    mrb_full_gc(mrb);
-    return mrb_bool_value(view == first && copy == first && viewed.bytes() == first &&
-                          std::string_view(RSTRING_PTR(text), 5) == "other");
+    const mruby::RString text = owned.str_new("abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz");
+    mruby::RString copied = owned.str_new("abc");
+    const mruby::RArray array = owned.ary_new();
+    const mruby::RHash hash = owned.hash_new();
+    const mruby::RClass klass = owned.define_class("MrubyCppMade");
+    mrb_full_gc(owned.get());
+    return mrb_bool_value(text.bytes().substr(0, 3) == "abc" && text.bytes().size() == 62 &&
+                          copied.bytes() == "abc" && array.size() == 0 && hash.size() == 0 &&
+                          klass.name() == "MrubyCppMade");
+}
+
+// The reason mruby-cpp exists: a method of one type does not compile on
+// another, and no type converts to another, explicitly or implicitly.
+template <class T>
+concept has_bytes = requires(const T &t) { t.bytes(); };
+template <class T>
+concept has_size = requires(const T &t) { t.size(); };
+template <class T>
+concept has_name = requires(const T &t) { t.name(); };
+template <class From, class To>
+concept converts = std::is_convertible_v<From, To> || std::is_constructible_v<To, From>;
+
+static mrb_value types_stay_apart_q(mrb_state *, mrb_value)
+{
+    using mruby::RArray, mruby::RClass, mruby::RHash, mruby::RString;
+    const bool methods = has_bytes<RString> && !has_bytes<RHash> && !has_bytes<RArray> && !has_bytes<RClass> &&
+                         has_size<RArray> && has_size<RHash> && !has_size<RString> && !has_size<RClass> &&
+                         has_name<RClass> && !has_name<RString> && !has_name<RArray> && !has_name<RHash>;
+    const bool apart = !converts<RString, RHash> && !converts<RHash, RString> && !converts<RString, RArray> &&
+                       !converts<RArray, RString> && !converts<RArray, RHash> && !converts<RHash, RArray> &&
+                       !converts<RClass, RString> && !converts<RString, RClass> && !converts<RClass, RHash> &&
+                       !converts<RHash, RClass> && !converts<RClass, RArray> && !converts<RArray, RClass> &&
+                       !converts<mrb_value, RString> && !converts<RString, mrb_value>;
+    return mrb_bool_value(methods && apart);
 }
 
 /* Whether an mruby::RString throws when it is read after its state ended:
@@ -278,8 +298,8 @@ extern "C" void mrb_mruby_cpp_gem_test(mrb_state *mrb)
                                protect_rethrows_cxx_exception_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "singleton_frozen", singleton_frozen_m, MRB_ARGS_REQ(1));
     mrb_define_module_function(mrb, test, "literals?", literals_q, MRB_ARGS_NONE());
-    mrb_define_module_function(mrb, test, "string_view_after_change?", string_view_after_change_m,
-                               MRB_ARGS_NONE());
+    mrb_define_module_function(mrb, test, "objects_survive_gc?", objects_survive_gc_q, MRB_ARGS_NONE());
+    mrb_define_module_function(mrb, test, "types_stay_apart?", types_stay_apart_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "string_after_close_throws?", string_after_close_throws_q,
                                MRB_ARGS_NONE());
 }
