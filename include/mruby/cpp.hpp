@@ -12,6 +12,12 @@
 #include <mruby/variable.h>
 
 #include <cstddef>
+#include <concepts>
+#include <utility>
+#include <tuple>
+#include <span>
+#include <optional>
+#include <cstdint>
 #include <exception>
 #include <expected>
 #include <experimental/scope>
@@ -107,6 +113,12 @@ inline std::string_view class_name(mrb_state *const mrb, const mrb_value klass)
     return mrb_class_name(mrb, mrb_class_ptr(klass));
 }
 
+inline bool class_p(const mrb_value value)
+{
+    return mrb_type(value) == MRB_TT_CLASS || mrb_type(value) == MRB_TT_MODULE ||
+           mrb_type(value) == MRB_TT_SCLASS;
+}
+
 
 struct lifetime {
     bool alive = true;
@@ -121,22 +133,27 @@ inline void lifetime_end(mrb_state *, void *const held)
 
 inline constexpr mrb_data_type wrapper{"mruby-cpp", lifetime_end};
 
-class state;
+struct clock {
+    std::uint64_t epoch = 0;
+    bool open = true;
+};
 
 class handle
 {
     std::shared_ptr<const lifetime> life;
+    std::shared_ptr<clock> time;
     mrb_state *mrb;
     mrb_value object;
 
   public:
-    handle(std::shared_ptr<const lifetime> given_life, mrb_state *const given_mrb, const mrb_value given)
-        : life(std::move(given_life)), mrb(given_mrb), object(given)
+    handle(std::shared_ptr<const lifetime> given_life, std::shared_ptr<clock> given_time,
+           mrb_state *const given_mrb, const mrb_value given)
+        : life(std::move(given_life)), time(std::move(given_time)), mrb(given_mrb), object(given)
     {
     }
     mrb_state *state() const
     {
-        if (!life->alive) [[unlikely]]
+        if (!life->alive || !time->open) [[unlikely]]
             throw std::logic_error("an mruby object is used after mruby freed it");
         return mrb;
     }
@@ -145,7 +162,71 @@ class handle
         (void)state();
         return object;
     }
+    const std::shared_ptr<clock> &clock_of() const
+    {
+        return time;
+    }
 };
+
+class borrowed
+{
+    std::shared_ptr<clock> time;
+    std::uint64_t epoch;
+    mrb_state *mrb;
+    mrb_value object;
+
+  public:
+    borrowed(std::shared_ptr<clock> given_time, mrb_state *const given_mrb, const mrb_value given)
+        : time(std::move(given_time)), epoch(time->epoch), mrb(given_mrb), object(given)
+    {
+    }
+    mrb_state *state() const
+    {
+        if (!time->open || time->epoch != epoch) [[unlikely]]
+            throw std::logic_error("an mruby view is used after Ruby ran");
+        return mrb;
+    }
+    mrb_value value() const
+    {
+        (void)state();
+        return object;
+    }
+    const std::shared_ptr<clock> &clock_of() const
+    {
+        return time;
+    }
+};
+
+inline handle wrap(mrb_state *const mrb, std::shared_ptr<clock> time, const mrb_value object, const int arena)
+{
+    std::experimental::scope_exit restore([mrb, arena] { mrb_gc_arena_restore(mrb, arena); });
+    mrb_gc_protect(mrb, object);
+    auto held = std::make_unique<std::shared_ptr<lifetime>>(std::make_shared<lifetime>());
+    std::shared_ptr<const lifetime> life = *held;
+    RData *const data = mrb_data_object_alloc(mrb, mrb->object_class, held.get(), &wrapper);
+    held.release();
+    const mrb_value carrier = mrb_obj_value(data);
+    mrb_iv_set(mrb, carrier, mrb_intern_lit(mrb, "__object__"), object);
+    restore.release();
+    mrb_gc_arena_restore(mrb, arena);
+    mrb_gc_protect(mrb, carrier);
+    return handle(std::move(life), std::move(time), mrb, object);
+}
+
+inline handle wrap(mrb_state *const mrb, std::shared_ptr<clock> time, const mrb_value object)
+{
+    return wrap(mrb, std::move(time), object, mrb_gc_arena_save(mrb));
+}
+
+class state;
+class RArray;
+class RHash;
+struct access;
+struct clock;
+template <class T> struct answer;
+template <class T, class Key>
+std::optional<typename answer<T>::type> hash_get(const std::shared_ptr<clock> &time, mrb_state *mrb,
+                                                 mrb_value hash, const Key &key);
 
 class RString
 {
@@ -156,6 +237,38 @@ class RString
     }
 
   public:
+    static bool type_p(const mrb_value value)
+    {
+        return mrb_string_p(value);
+    }
+
+    class view
+    {
+        borrowed seen;
+        friend class RString;
+        friend class RArray;
+        friend class RHash;
+        friend class state;
+        friend struct access;
+        explicit view(borrowed given) : seen(std::move(given))
+        {
+        }
+        mrb_value value_of() const
+        {
+            return seen.value();
+        }
+
+      public:
+        std::string_view bytes() const &
+        {
+            return string_bytes(seen.value());
+        }
+    };
+
+    explicit RString(const view &from)
+        : held(wrap(from.seen.state(), from.seen.clock_of(), from.seen.value()))
+    {
+    }
     std::string bytes() &
     {
         return std::string(string_bytes(held.value()));
@@ -163,6 +276,52 @@ class RString
     std::string_view bytes() const &
     {
         return string_bytes(held.value());
+    }
+    mrb_value value_of() const
+    {
+        return held.value();
+    }
+};
+
+template <class T>
+concept object_type = requires(const mrb_value value) {
+    { T::type_p(value) } -> std::same_as<bool>;
+    typename T::view;
+};
+
+template <class T>
+concept scalar = std::same_as<T, mrb_int> || std::same_as<T, mrb_float> || std::same_as<T, bool>;
+
+template <class T> struct answer;
+template <object_type T> struct answer<T> {
+    using type = typename T::view;
+};
+template <scalar T> struct answer<T> {
+    using type = T;
+};
+
+struct access {
+    template <class T>
+    static std::optional<typename answer<T>::type> read(const std::shared_ptr<clock> &time, mrb_state *const mrb,
+                                                  const mrb_value value)
+    {
+        if constexpr (object_type<T>) {
+            if (!T::type_p(value))
+                return std::nullopt;
+            return typename T::view(borrowed(time, mrb, value));
+        } else if constexpr (std::same_as<T, mrb_int>) {
+            if (!mrb_integer_p(value))
+                return std::nullopt;
+            return mrb_integer(value);
+        } else if constexpr (std::same_as<T, mrb_float>) {
+            if (!mrb_float_p(value))
+                return std::nullopt;
+            return mrb_float(value);
+        } else {
+            if (!mrb_true_p(value) && !mrb_false_p(value))
+                return std::nullopt;
+            return mrb_true_p(value);
+        }
     }
 };
 
@@ -174,10 +333,63 @@ class RArray
     {
     }
 
+    template <class T>
+    static std::optional<typename answer<T>::type> element(const std::shared_ptr<clock> &time,
+                                                           mrb_state *const mrb, const mrb_value array,
+                                                           const std::size_t index)
+    {
+        if (index >= array_length(array))
+            return std::nullopt;
+        return access::read<T>(time, mrb, mrb_ary_entry(array, static_cast<mrb_int>(index)));
+    }
+
   public:
+    static bool type_p(const mrb_value value)
+    {
+        return mrb_array_p(value);
+    }
+
+    class view
+    {
+        borrowed seen;
+        friend class RArray;
+        friend class RHash;
+        friend class state;
+        friend struct access;
+        explicit view(borrowed given) : seen(std::move(given))
+        {
+        }
+        mrb_value value_of() const
+        {
+            return seen.value();
+        }
+
+      public:
+        std::size_t size() const
+        {
+            return array_length(seen.value());
+        }
+        template <class T> std::optional<typename answer<T>::type> at(const std::size_t index) const
+        {
+            return element<T>(seen.clock_of(), seen.state(), seen.value(), index);
+        }
+    };
+
+    explicit RArray(const view &from)
+        : held(wrap(from.seen.state(), from.seen.clock_of(), from.seen.value()))
+    {
+    }
     std::size_t size() const
     {
         return array_length(held.value());
+    }
+    template <class T> std::optional<typename answer<T>::type> at(const std::size_t index) const
+    {
+        return element<T>(held.clock_of(), held.state(), held.value(), index);
+    }
+    mrb_value value_of() const
+    {
+        return held.value();
     }
 };
 
@@ -190,10 +402,54 @@ class RHash
     }
 
   public:
+    static bool type_p(const mrb_value value)
+    {
+        return mrb_hash_p(value);
+    }
+
+    class view
+    {
+        borrowed seen;
+        friend class RHash;
+        friend class RArray;
+        friend class state;
+        friend struct access;
+        explicit view(borrowed given) : seen(std::move(given))
+        {
+        }
+        mrb_value value_of() const
+        {
+            return seen.value();
+        }
+
+      public:
+        std::size_t size() const
+        {
+            mrb_state *const mrb = seen.state();
+            return static_cast<std::size_t>(mrb_hash_size(mrb, seen.value()));
+        }
+        template <class T, class Key> std::optional<typename answer<T>::type> get(const Key &key) const
+        {
+            return hash_get<T>(seen.clock_of(), seen.state(), seen.value(), key);
+        }
+    };
+
+    explicit RHash(const view &from)
+        : held(wrap(from.seen.state(), from.seen.clock_of(), from.seen.value()))
+    {
+    }
     std::size_t size() const
     {
         mrb_state *const mrb = held.state();
         return static_cast<std::size_t>(mrb_hash_size(mrb, held.value()));
+    }
+    template <class T, class Key> std::optional<typename answer<T>::type> get(const Key &key) const
+    {
+        return hash_get<T>(held.clock_of(), held.state(), held.value(), key);
+    }
+    mrb_value value_of() const
+    {
+        return held.value();
     }
 };
 
@@ -206,11 +462,110 @@ class RClass
     }
 
   public:
+    static bool type_p(const mrb_value value)
+    {
+        return class_p(value);
+    }
+
+    class view
+    {
+        borrowed seen;
+        friend class RClass;
+        friend class RArray;
+        friend class RHash;
+        friend class state;
+        friend struct access;
+        explicit view(borrowed given) : seen(std::move(given))
+        {
+        }
+        mrb_value value_of() const
+        {
+            return seen.value();
+        }
+
+      public:
+        std::string_view name() const
+        {
+            mrb_state *const mrb = seen.state();
+            return class_name(mrb, seen.value());
+        }
+    };
+
+    explicit RClass(const view &from)
+        : held(wrap(from.seen.state(), from.seen.clock_of(), from.seen.value()))
+    {
+    }
     std::string_view name() const
     {
         mrb_state *const mrb = held.state();
         return class_name(mrb, held.value());
     }
+    mrb_value value_of() const
+    {
+        return held.value();
+    }
+};
+
+template <class T>
+concept view_type = std::same_as<T, RString::view> || std::same_as<T, RArray::view> ||
+                    std::same_as<T, RHash::view> || std::same_as<T, RClass::view>;
+
+inline mrb_value key_of(mrb_state *const mrb, const mrb_int given)
+{
+    return mrb_int_value(mrb, given);
+}
+inline mrb_value key_of(mrb_state *const mrb, const mrb_float given)
+{
+    return mrb_float_value(mrb, given);
+}
+template <class T>
+    requires std::same_as<T, RString> || std::same_as<T, RString::view>
+mrb_value key_of(mrb_state *, const T &given)
+{
+    return given.value_of();
+}
+
+template <class T, class Key>
+std::optional<typename answer<T>::type> hash_get(const std::shared_ptr<clock> &time, mrb_state *const mrb,
+                                                 const mrb_value hash, const Key &key)
+{
+    const mrb_value found = mrb_hash_fetch(mrb, hash, key_of(mrb, key), mrb_undef_value());
+    if (mrb_undef_p(found))
+        return std::nullopt;
+    return access::read<T>(time, mrb, found);
+}
+
+template <class F> struct parameters_of : parameters_of<decltype(&F::operator())> {
+};
+template <class C, class R, class... P> struct parameters_of<R (C::*)(P...) const> {
+    using result = R;
+    using types = std::tuple<std::remove_cvref_t<P>...>;
+};
+template <class C, class R, class... P> struct parameters_of<R (C::*)(P...)> {
+    using result = R;
+    using types = std::tuple<std::remove_cvref_t<P>...>;
+};
+
+template <class T> struct viewed;
+template <class T>
+    requires requires { typename T::view; }
+struct viewed<T> {
+    using type = T;
+};
+template <> struct viewed<RString::view> {
+    using type = RString;
+};
+template <> struct viewed<RArray::view> {
+    using type = RArray;
+};
+template <> struct viewed<RHash::view> {
+    using type = RHash;
+};
+template <> struct viewed<RClass::view> {
+    using type = RClass;
+};
+template <scalar T> struct viewed<T> {
+    using type = T;
 };
 
 class state
@@ -222,24 +577,95 @@ class state
         std::unordered_set<mrb_value *> roots;
     };
     std::shared_ptr<owned> shared = std::make_shared<owned>();
+    std::shared_ptr<clock> time = std::make_shared<clock>();
 
-    template <class R, class F> R wrap(F &&make)
+    template <class R, class F> R make(F &&made)
     {
         mrb_state *const mrb = shared->mrb;
         const int arena = mrb_gc_arena_save(mrb);
         std::experimental::scope_exit restore([mrb, arena] { mrb_gc_arena_restore(mrb, arena); });
-        const mrb_value object = make(mrb);
-        auto held = std::make_unique<std::shared_ptr<lifetime>>(std::make_shared<lifetime>());
-        std::shared_ptr<const lifetime> life = *held;
-        RData *const data = mrb_data_object_alloc(mrb, mrb->object_class, held.get(), &wrapper);
-        held.release();
-        const mrb_value carrier = mrb_obj_value(data);
-        mrb_iv_set(mrb, carrier, mrb_intern_lit(mrb, "__object__"), object);
+        const mrb_value object = made(mrb);
         restore.release();
-        mrb_gc_arena_restore(mrb, arena);
-        mrb_gc_protect(mrb, carrier);
-        return R(handle(std::move(life), mrb, object));
+        return R(wrap(mrb, time, object, arena));
     }
+
+    mrb_value argument(const mrb_int given) const
+    {
+        return mrb_int_value(shared->mrb, given);
+    }
+    mrb_value argument(const mrb_float given) const
+    {
+        return mrb_float_value(shared->mrb, given);
+    }
+    mrb_value argument(const bool given) const
+    {
+        return mrb_bool_value(given);
+    }
+    mrb_value argument(std::nullptr_t) const
+    {
+        return mrb_nil_value();
+    }
+    template <object_type T> mrb_value argument(const T &given) const
+    {
+        return given.value_of();
+    }
+    template <view_type V> mrb_value argument(const V &given) const
+    {
+        return given.value_of();
+    }
+
+    template <class F> struct block {
+        const F *body;
+        std::exception_ptr thrown;
+        std::shared_ptr<clock> time;
+    };
+
+    template <class F> static mrb_value block_call(mrb_state *const mrb, mrb_value)
+    {
+        const mrb_value env = mrb_proc_cfunc_env_get(mrb, 0);
+        const mrb_value carrier = mrb_proc_cfunc_env_get(mrb, 1);
+        RData *const data = static_cast<RData *>(mrb_ptr(carrier));
+        if (data->type != &wrapper || !(*static_cast<std::shared_ptr<lifetime> *>(data->data))->alive)
+            [[unlikely]]
+            mrb_raise(mrb, E_RUNTIME_ERROR, "a C++ block is called after the call that gave it returned");
+        block<F> *const call = static_cast<block<F> *>(mrb_cptr(env));
+        ++call->time->epoch;
+        const mrb_value *argv = nullptr;
+        mrb_int argc = 0;
+        mrb_get_args(mrb, "*", &argv, &argc);
+        using types = typename parameters_of<F>::types;
+        constexpr std::size_t count = std::tuple_size_v<types>;
+        if (static_cast<std::size_t>(argc) != count) [[unlikely]]
+            mrb_raisef(mrb, E_ARGUMENT_ERROR, "wrong number of arguments (given %i, expected %i)", argc,
+                       static_cast<mrb_int>(count));
+        const std::span<const mrb_value> given(argv, static_cast<std::size_t>(argc));
+        bool wrong = false;
+        mrb_value result = mrb_nil_value();
+        try {
+            [&]<std::size_t... I>(std::index_sequence<I...>) {
+                auto read_all = std::make_tuple(
+                    access::read<typename viewed<std::tuple_element_t<I, types>>::type>(call->time, mrb, given[I])...);
+                if (!(std::get<I>(read_all).has_value() && ...)) {
+                    wrong = true;
+                    return;
+                }
+                if constexpr (std::is_void_v<typename parameters_of<F>::result>)
+                    (*call->body)(*std::get<I>(read_all)...);
+                else
+                    result = mrb_nil_value(), (void)(*call->body)(*std::get<I>(read_all)...);
+            }(std::make_index_sequence<count>{});
+        } catch (...) {
+            call->thrown = std::current_exception();
+            mrb_raise(mrb, E_RUNTIME_ERROR, "a C++ block threw");
+        }
+        if (wrong) [[unlikely]]
+            mrb_raise(mrb, E_TYPE_ERROR, "an argument of a C++ block has another type");
+        return result;
+    }
+
+    template <class T> static constexpr bool callable_block = !object_type<T> && !scalar<T> &&
+                                                             !std::same_as<T, std::nullptr_t> &&
+                                                             !view_type<T>;
 
   public:
     state()
@@ -257,6 +683,7 @@ class state
     state &operator=(const state &) = delete;
     ~state()
     {
+        time->open = false;
         for (mrb_value *const cell : shared->roots) {
             if (!shared->closes)
                 mrb_gc_unregister(shared->mrb, *cell);
@@ -269,24 +696,77 @@ class state
     }
     RString str_new(const std::string_view bytes)
     {
-        return wrap<RString>([bytes](mrb_state *const mrb) {
+        return make<RString>([bytes](mrb_state *const mrb) {
             return mrb_str_new(mrb, bytes.data(), static_cast<mrb_int>(bytes.size()));
         });
     }
     RArray ary_new()
     {
-        return wrap<RArray>([](mrb_state *const mrb) { return mrb_ary_new(mrb); });
+        return make<RArray>([](mrb_state *const mrb) { return mrb_ary_new(mrb); });
     }
     RHash hash_new()
     {
-        return wrap<RHash>([](mrb_state *const mrb) { return mrb_hash_new(mrb); });
+        return make<RHash>([](mrb_state *const mrb) { return mrb_hash_new(mrb); });
     }
     RClass define_class(const std::string &name)
     {
-        return wrap<RClass>([&name](mrb_state *const mrb) {
+        return make<RClass>([&name](mrb_state *const mrb) {
             return mrb_obj_value(mrb_define_class(mrb, name.c_str(), mrb->object_class));
         });
     }
+
+    template <mrb_sym Method, class Result = void, class Receiver, class... Args>
+    auto funcall(const Receiver &receiver, const Args &...given)
+    {
+        mrb_state *const mrb = shared->mrb;
+        const mrb_value self = argument(receiver);
+        constexpr std::size_t count = sizeof...(Args);
+        using last = std::tuple_element_t<count == 0 ? 0 : count - 1, std::tuple<Args..., void>>;
+        constexpr bool with_block = count > 0 && callable_block<last>;
+        constexpr std::size_t plain = with_block ? count - 1 : count;
+        const int arena = mrb_gc_arena_save(mrb);
+        std::experimental::scope_exit restore([mrb, arena] { mrb_gc_arena_restore(mrb, arena); });
+        std::array<mrb_value, plain> argv{};
+        mrb_value blk = mrb_nil_value();
+        auto all = std::forward_as_tuple(given...);
+        [&]<std::size_t... I>(std::index_sequence<I...>) {
+            ((argv[I] = argument(std::get<I>(all))), ...);
+        }(std::make_index_sequence<plain>{});
+        using body_type = std::conditional_t<with_block, std::remove_cvref_t<last>, int>;
+        block<body_type> call{nullptr, nullptr, time};
+        std::shared_ptr<lifetime> *life = nullptr;
+        if constexpr (with_block) {
+            call.body = &std::get<count - 1>(all);
+            auto held = std::make_unique<std::shared_ptr<lifetime>>(std::make_shared<lifetime>());
+            RData *const data = mrb_data_object_alloc(mrb, mrb->object_class, held.get(), &wrapper);
+            life = held.release();
+            const std::array<mrb_value, 2> env{mrb_cptr_value(mrb, &call), mrb_obj_value(data)};
+            blk = mrb_obj_value(mrb_proc_new_cfunc_with_env(mrb, &block_call<body_type>, 2, env.data()));
+        }
+        const std::shared_ptr<lifetime> ended = life != nullptr ? *life : nullptr;
+        const std::experimental::scope_exit end_block([&ended] {
+            if (ended != nullptr)
+                ended->alive = false;
+        });
+        ++time->epoch;
+        const std::expected<mrb_value, mrb_value> answered = protect(mrb, [&](mrb_state *const m) {
+            return mrb_funcall_with_block(m, self, Method, static_cast<mrb_int>(plain), argv.data(), blk);
+        });
+        ++time->epoch;
+        if (call.thrown) [[unlikely]]
+            std::rethrow_exception(call.thrown);
+        if (!answered) [[unlikely]] {
+            const mrb_value message = mrb_funcall_argv(mrb, answered.error(), mrb_intern_lit(mrb, "message"), 0,
+                                                       nullptr);
+            throw std::runtime_error(std::string(mrb_string_p(message) ? string_bytes(message) : "a Ruby raise"));
+        }
+        restore.release();
+        mrb_gc_arena_restore(mrb, arena);
+        mrb_gc_protect(mrb, *answered);
+        if constexpr (!std::is_void_v<Result>)
+            return access::read<Result>(time, mrb, *answered);
+    }
+
     mrb_state *get() const
     {
         return shared->mrb;
