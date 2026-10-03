@@ -174,11 +174,17 @@ class borrowed
     std::uint64_t epoch;
     mrb_state *mrb;
     mrb_value object;
+    int arena;
 
   public:
-    borrowed(std::shared_ptr<clock> given_time, mrb_state *const given_mrb, const mrb_value given)
-        : time(std::move(given_time)), epoch(time->epoch), mrb(given_mrb), object(given)
+    borrowed(std::shared_ptr<clock> given_time, mrb_state *const given_mrb, const mrb_value given,
+             const int made_at = -1)
+        : time(std::move(given_time)), epoch(time->epoch), mrb(given_mrb), object(given), arena(made_at)
     {
+    }
+    int made_at() const
+    {
+        return arena;
     }
     mrb_state *state() const
     {
@@ -221,42 +227,74 @@ inline handle wrap(mrb_state *const mrb, std::shared_ptr<clock> time, const mrb_
 class state;
 class RArray;
 class RHash;
+class value;
 struct access;
-struct clock;
 template <class T> struct answer;
 template <class T, class Key>
 std::optional<typename answer<T>::type> hash_get(const std::shared_ptr<clock> &time, mrb_state *mrb,
                                                  mrb_value hash, const Key &key);
 
-class RString
+class RBasic
 {
+  protected:
     handle held;
-    friend class state;
-    explicit RString(handle given) : held(std::move(given))
+    explicit RBasic(handle given) : held(std::move(given))
     {
     }
 
   public:
-    static bool type_p(const mrb_value value)
+    static bool type_p(const mrb_value given)
     {
-        return mrb_string_p(value);
+        return !mrb_immediate_p(given);
     }
 
     class view
     {
+      protected:
         borrowed seen;
+        explicit view(borrowed given) : seen(std::move(given))
+        {
+        }
+        friend class RBasic;
+        friend class value;
+        friend class RArray;
+        friend class RHash;
+        friend class state;
+        friend struct access;
+        mrb_value value_of() const
+        {
+            return seen.value();
+        }
+    };
+
+  protected:
+    mrb_value value_of() const
+    {
+        return held.value();
+    }
+    friend class state;
+    friend struct access;
+};
+
+class RString : public RBasic
+{
+    friend class state;
+    using RBasic::RBasic;
+
+  public:
+    static bool type_p(const mrb_value given)
+    {
+        return mrb_string_p(given);
+    }
+
+    class view : public RBasic::view
+    {
+        using RBasic::view::view;
         friend class RString;
         friend class RArray;
         friend class RHash;
         friend class state;
         friend struct access;
-        explicit view(borrowed given) : seen(std::move(given))
-        {
-        }
-        mrb_value value_of() const
-        {
-            return seen.value();
-        }
 
       public:
         std::string_view bytes() const &
@@ -265,8 +303,7 @@ class RString
         }
     };
 
-    explicit RString(const view &from)
-        : held(wrap(from.seen.state(), from.seen.clock_of(), from.seen.value()))
+    explicit RString(const view &from) : RBasic(wrap(from.seen.state(), from.seen.clock_of(), from.seen.value()))
     {
     }
     std::string bytes() &
@@ -277,22 +314,17 @@ class RString
     {
         return string_bytes(held.value());
     }
-    mrb_value value_of() const
-    {
-        return held.value();
-    }
 };
 
 template <class T>
-concept object_type = requires(const mrb_value value) {
-    { T::type_p(value) } -> std::same_as<bool>;
+concept object_type = requires(const mrb_value given) {
+    { T::type_p(given) } -> std::same_as<bool>;
     typename T::view;
 };
 
 template <class T>
 concept scalar = std::same_as<T, mrb_int> || std::same_as<T, mrb_float> || std::same_as<T, bool>;
 
-template <class T> struct answer;
 template <object_type T> struct answer<T> {
     using type = typename T::view;
 };
@@ -303,35 +335,93 @@ template <scalar T> struct answer<T> {
 struct access {
     template <class T>
     static std::optional<typename answer<T>::type> read(const std::shared_ptr<clock> &time, mrb_state *const mrb,
-                                                  const mrb_value value)
+                                                        const mrb_value given)
     {
         if constexpr (object_type<T>) {
-            if (!T::type_p(value))
+            if (!T::type_p(given))
                 return std::nullopt;
-            return typename T::view(borrowed(time, mrb, value));
+            return typename T::view(borrowed(time, mrb, given));
         } else if constexpr (std::same_as<T, mrb_int>) {
-            if (!mrb_integer_p(value))
+            if (!mrb_integer_p(given))
                 return std::nullopt;
-            return mrb_integer(value);
+            return mrb_integer(given);
         } else if constexpr (std::same_as<T, mrb_float>) {
-            if (!mrb_float_p(value))
+            if (!mrb_float_p(given))
                 return std::nullopt;
-            return mrb_float(value);
+            return mrb_float(given);
         } else {
-            if (!mrb_true_p(value) && !mrb_false_p(value))
+            if (!mrb_true_p(given) && !mrb_false_p(given))
                 return std::nullopt;
-            return mrb_true_p(value);
+            return mrb_true_p(given);
         }
+    }
+    static const borrowed &seen_of(const RBasic::view &given)
+    {
+        return given.seen;
+    }
+    template <class T> static mrb_value raw(const T &given)
+    {
+        return given.value_of();
     }
 };
 
-class RArray
+class value
 {
-    handle held;
+    borrowed seen;
     friend class state;
-    explicit RArray(handle given) : held(std::move(given))
+    friend class RArray;
+    friend class RHash;
+    explicit value(borrowed given) : seen(std::move(given))
     {
     }
+
+  public:
+    value(const RBasic::view &given) : seen(access::seen_of(given))
+    {
+    }
+    template <class T> std::optional<typename answer<T>::type> as() const
+    {
+        return access::read<T>(seen.clock_of(), seen.state(), seen.value());
+    }
+    bool nil_p() const
+    {
+        return mrb_nil_p(seen.value());
+    }
+
+  private:
+    friend struct access;
+    mrb_value value_of() const
+    {
+        return seen.value();
+    }
+};
+
+inline int attached_below(const int top, const borrowed &child)
+{
+    return child.made_at() >= 0 && top == child.made_at() + 1 ? child.made_at() : -1;
+}
+
+inline int attached_below(const int top, const borrowed &key, const borrowed &child)
+{
+    if (key.made_at() < 0)
+        return attached_below(top, child);
+    if (child.made_at() < 0)
+        return attached_below(top, key);
+    const int low = std::min(key.made_at(), child.made_at());
+    const int high = std::max(key.made_at(), child.made_at());
+    return high == low + 1 && top == high + 1 ? low : -1;
+}
+
+inline void attach_done(mrb_state *const mrb, const int below)
+{
+    if (below >= 0)
+        mrb_gc_arena_restore(mrb, below);
+}
+
+class RArray : public RBasic
+{
+    friend class state;
+    using RBasic::RBasic;
 
     template <class T>
     static std::optional<typename answer<T>::type> element(const std::shared_ptr<clock> &time,
@@ -344,25 +434,18 @@ class RArray
     }
 
   public:
-    static bool type_p(const mrb_value value)
+    static bool type_p(const mrb_value given)
     {
-        return mrb_array_p(value);
+        return mrb_array_p(given);
     }
 
-    class view
+    class view : public RBasic::view
     {
-        borrowed seen;
+        using RBasic::view::view;
         friend class RArray;
         friend class RHash;
         friend class state;
         friend struct access;
-        explicit view(borrowed given) : seen(std::move(given))
-        {
-        }
-        mrb_value value_of() const
-        {
-            return seen.value();
-        }
 
       public:
         std::size_t size() const
@@ -373,10 +456,16 @@ class RArray
         {
             return element<T>(seen.clock_of(), seen.state(), seen.value(), index);
         }
+        void push(const value &child) const
+        {
+            mrb_state *const mrb = seen.state();
+            const int below = attached_below(mrb_gc_arena_save(mrb), child.seen);
+            mrb_ary_push(mrb, seen.value(), child.seen.value());
+            attach_done(mrb, below);
+        }
     };
 
-    explicit RArray(const view &from)
-        : held(wrap(from.seen.state(), from.seen.clock_of(), from.seen.value()))
+    explicit RArray(const view &from) : RBasic(wrap(from.seen.state(), from.seen.clock_of(), from.seen.value()))
     {
     }
     std::size_t size() const
@@ -387,128 +476,14 @@ class RArray
     {
         return element<T>(held.clock_of(), held.state(), held.value(), index);
     }
-    mrb_value value_of() const
-    {
-        return held.value();
-    }
-};
-
-class RHash
-{
-    handle held;
-    friend class state;
-    explicit RHash(handle given) : held(std::move(given))
-    {
-    }
-
-  public:
-    static bool type_p(const mrb_value value)
-    {
-        return mrb_hash_p(value);
-    }
-
-    class view
-    {
-        borrowed seen;
-        friend class RHash;
-        friend class RArray;
-        friend class state;
-        friend struct access;
-        explicit view(borrowed given) : seen(std::move(given))
-        {
-        }
-        mrb_value value_of() const
-        {
-            return seen.value();
-        }
-
-      public:
-        std::size_t size() const
-        {
-            mrb_state *const mrb = seen.state();
-            return static_cast<std::size_t>(mrb_hash_size(mrb, seen.value()));
-        }
-        template <class T, class Key> std::optional<typename answer<T>::type> get(const Key &key) const
-        {
-            return hash_get<T>(seen.clock_of(), seen.state(), seen.value(), key);
-        }
-    };
-
-    explicit RHash(const view &from)
-        : held(wrap(from.seen.state(), from.seen.clock_of(), from.seen.value()))
-    {
-    }
-    std::size_t size() const
+    void push(const value &child) const
     {
         mrb_state *const mrb = held.state();
-        return static_cast<std::size_t>(mrb_hash_size(mrb, held.value()));
-    }
-    template <class T, class Key> std::optional<typename answer<T>::type> get(const Key &key) const
-    {
-        return hash_get<T>(held.clock_of(), held.state(), held.value(), key);
-    }
-    mrb_value value_of() const
-    {
-        return held.value();
+        const int below = attached_below(mrb_gc_arena_save(mrb), child.seen);
+        mrb_ary_push(mrb, held.value(), child.seen.value());
+        attach_done(mrb, below);
     }
 };
-
-class RClass
-{
-    handle held;
-    friend class state;
-    explicit RClass(handle given) : held(std::move(given))
-    {
-    }
-
-  public:
-    static bool type_p(const mrb_value value)
-    {
-        return class_p(value);
-    }
-
-    class view
-    {
-        borrowed seen;
-        friend class RClass;
-        friend class RArray;
-        friend class RHash;
-        friend class state;
-        friend struct access;
-        explicit view(borrowed given) : seen(std::move(given))
-        {
-        }
-        mrb_value value_of() const
-        {
-            return seen.value();
-        }
-
-      public:
-        std::string_view name() const
-        {
-            mrb_state *const mrb = seen.state();
-            return class_name(mrb, seen.value());
-        }
-    };
-
-    explicit RClass(const view &from)
-        : held(wrap(from.seen.state(), from.seen.clock_of(), from.seen.value()))
-    {
-    }
-    std::string_view name() const
-    {
-        mrb_state *const mrb = held.state();
-        return class_name(mrb, held.value());
-    }
-    mrb_value value_of() const
-    {
-        return held.value();
-    }
-};
-
-template <class T>
-concept view_type = std::same_as<T, RString::view> || std::same_as<T, RArray::view> ||
-                    std::same_as<T, RHash::view> || std::same_as<T, RClass::view>;
 
 inline mrb_value key_of(mrb_state *const mrb, const mrb_int given)
 {
@@ -522,8 +497,116 @@ template <class T>
     requires std::same_as<T, RString> || std::same_as<T, RString::view>
 mrb_value key_of(mrb_state *, const T &given)
 {
-    return given.value_of();
+    return access::raw(given);
 }
+
+class RHash : public RBasic
+{
+    friend class state;
+    using RBasic::RBasic;
+
+  public:
+    static bool type_p(const mrb_value given)
+    {
+        return mrb_hash_p(given);
+    }
+
+    class view : public RBasic::view
+    {
+        using RBasic::view::view;
+        friend class RHash;
+        friend class RArray;
+        friend class state;
+        friend struct access;
+
+      public:
+        std::size_t size() const
+        {
+            mrb_state *const mrb = seen.state();
+            return static_cast<std::size_t>(mrb_hash_size(mrb, seen.value()));
+        }
+        template <class T, class Key> std::optional<typename answer<T>::type> get(const Key &key) const
+        {
+            return hash_get<T>(seen.clock_of(), seen.state(), seen.value(), key);
+        }
+        template <class Key> void set(const Key &key, const value &child) const
+        {
+            mrb_state *const mrb = seen.state();
+            int below = -1;
+            if constexpr (std::derived_from<Key, RBasic::view>)
+                below = attached_below(mrb_gc_arena_save(mrb), access::seen_of(key), child.seen);
+            else
+                below = attached_below(mrb_gc_arena_save(mrb), child.seen);
+            mrb_hash_set(mrb, seen.value(), key_of(mrb, key), child.seen.value());
+            attach_done(mrb, below);
+        }
+    };
+
+    explicit RHash(const view &from) : RBasic(wrap(from.seen.state(), from.seen.clock_of(), from.seen.value()))
+    {
+    }
+    std::size_t size() const
+    {
+        mrb_state *const mrb = held.state();
+        return static_cast<std::size_t>(mrb_hash_size(mrb, held.value()));
+    }
+    template <class T, class Key> std::optional<typename answer<T>::type> get(const Key &key) const
+    {
+        return hash_get<T>(held.clock_of(), held.state(), held.value(), key);
+    }
+    template <class Key> void set(const Key &key, const value &child) const
+    {
+        mrb_state *const mrb = held.state();
+        int below = -1;
+        if constexpr (std::derived_from<Key, RBasic::view>)
+            below = attached_below(mrb_gc_arena_save(mrb), access::seen_of(key), child.seen);
+        else
+            below = attached_below(mrb_gc_arena_save(mrb), child.seen);
+        mrb_hash_set(mrb, held.value(), key_of(mrb, key), child.seen.value());
+        attach_done(mrb, below);
+    }
+};
+
+class RClass : public RBasic
+{
+    friend class state;
+    using RBasic::RBasic;
+
+  public:
+    static bool type_p(const mrb_value given)
+    {
+        return class_p(given);
+    }
+
+    class view : public RBasic::view
+    {
+        using RBasic::view::view;
+        friend class RClass;
+        friend class RArray;
+        friend class RHash;
+        friend class state;
+        friend struct access;
+
+      public:
+        std::string_view name() const
+        {
+            mrb_state *const mrb = seen.state();
+            return class_name(mrb, seen.value());
+        }
+    };
+
+    explicit RClass(const view &from) : RBasic(wrap(from.seen.state(), from.seen.clock_of(), from.seen.value()))
+    {
+    }
+    std::string_view name() const
+    {
+        mrb_state *const mrb = held.state();
+        return class_name(mrb, held.value());
+    }
+};
+
+template <class T>
+concept view_type = std::derived_from<T, RBasic::view> || std::same_as<T, value>;
 
 template <class T, class Key>
 std::optional<typename answer<T>::type> hash_get(const std::shared_ptr<clock> &time, mrb_state *const mrb,
@@ -607,11 +690,11 @@ class state
     }
     template <object_type T> mrb_value argument(const T &given) const
     {
-        return given.value_of();
+        return access::raw(given);
     }
     template <view_type V> mrb_value argument(const V &given) const
     {
-        return given.value_of();
+        return access::raw(given);
     }
 
     template <class F> struct block {
@@ -707,6 +790,47 @@ class state
     RHash hash_new()
     {
         return make<RHash>([](mrb_state *const mrb) { return mrb_hash_new(mrb); });
+    }
+    value value_of(const mrb_int given)
+    {
+        mrb_state *const mrb = shared->mrb;
+        const int arena = mrb_gc_arena_save(mrb);
+        const mrb_value made = mrb_int_value(mrb, given);
+        return value(borrowed(time, mrb, made, mrb_gc_arena_save(mrb) == arena ? -1 : arena));
+    }
+    value value_of(const mrb_float given)
+    {
+        mrb_state *const mrb = shared->mrb;
+        const int arena = mrb_gc_arena_save(mrb);
+        const mrb_value made = mrb_float_value(mrb, given);
+        return value(borrowed(time, mrb, made, mrb_gc_arena_save(mrb) == arena ? -1 : arena));
+    }
+    value value_of(const bool given)
+    {
+        return value(borrowed(time, shared->mrb, mrb_bool_value(given)));
+    }
+    value value_of(std::nullptr_t)
+    {
+        return value(borrowed(time, shared->mrb, mrb_nil_value()));
+    }
+    RString::view str_new_view(const std::string_view bytes)
+    {
+        mrb_state *const mrb = shared->mrb;
+        const int arena = mrb_gc_arena_save(mrb);
+        return RString::view(
+            borrowed(time, mrb, mrb_str_new(mrb, bytes.data(), static_cast<mrb_int>(bytes.size())), arena));
+    }
+    RArray::view ary_new_view()
+    {
+        mrb_state *const mrb = shared->mrb;
+        const int arena = mrb_gc_arena_save(mrb);
+        return RArray::view(borrowed(time, mrb, mrb_ary_new(mrb), arena));
+    }
+    RHash::view hash_new_view()
+    {
+        mrb_state *const mrb = shared->mrb;
+        const int arena = mrb_gc_arena_save(mrb);
+        return RHash::view(borrowed(time, mrb, mrb_hash_new(mrb), arena));
     }
     RClass define_class(const std::string &name)
     {

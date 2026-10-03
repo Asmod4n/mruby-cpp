@@ -252,7 +252,10 @@ static mrb_value types_stay_apart_q(mrb_state *, mrb_value)
                        !converts<RArray, RString> && !converts<RArray, RHash> && !converts<RHash, RArray> &&
                        !converts<RClass, RString> && !converts<RString, RClass> && !converts<RClass, RHash> &&
                        !converts<RHash, RClass> && !converts<RClass, RArray> && !converts<RArray, RClass> &&
-                       !converts<mrb_value, RString> && !converts<RString, mrb_value>;
+                       !converts<mrb_value, RString> && !converts<RString, mrb_value> &&
+                       std::is_convertible_v<const RString &, const mruby::RBasic &> &&
+                       !converts<mruby::RBasic, RString> && !converts<mruby::RBasic::view, RString::view> &&
+                       !has_bytes<mruby::RBasic> && !has_bytes<mruby::value>;
     return mrb_bool_value(methods && apart);
 }
 
@@ -371,6 +374,35 @@ static mrb_value errors_pass_q(mrb_state *, mrb_value)
     return mrb_bool_value(cxx && ruby);
 }
 
+
+/* Builds [ "a", { "k" => 1 }, 2.5, nil ] the way a decoder does: every
+ * child is a view, only the root gets a wrapper. After a full GC the root
+ * still reads every child, and the arena is as deep as before. */
+static mrb_value build_like_decode_q(mrb_state *, mrb_value)
+{
+    mruby::state owned;
+    mrb_state *const mrb = owned.get();
+    const int before = mrb_gc_arena_save(mrb);
+    const mruby::RArray::view root_view = owned.ary_new_view();
+    root_view.push(owned.str_new_view("a"));
+    const mruby::RHash::view inner = owned.hash_new_view();
+    inner.set(mrb_int{0}, owned.value_of(mrb_int{1}));
+    inner.set(owned.str_new_view("k"), owned.value_of(mrb_int{1}));
+    root_view.push(inner);
+    root_view.push(owned.value_of(2.5));
+    root_view.push(owned.value_of(nullptr));
+    for (mrb_int i = 0; i < 10000; ++i)
+        root_view.push(owned.value_of(i << 40));
+    const int during = mrb_gc_arena_save(mrb);
+    const mruby::RArray root(root_view);
+    mrb_full_gc(mrb);
+    const std::optional<mruby::RString::view> a = root.at<mruby::RString>(0);
+    const std::optional<mruby::RHash::view> h = root.at<mruby::RHash>(1);
+    return mrb_bool_value(a && a->bytes() == "a" && h && h->size() == 2 && root.at<mrb_float>(2) == 2.5 &&
+                          root.size() == 10004 && root.at<mrb_int>(10003) == mrb_int{9999} << 40 &&
+                          during - before <= 1);
+}
+
 extern "C" void mrb_mruby_cpp_gem_test(mrb_state *mrb)
 {
     RClass *const test = mrb_define_module(mrb, "MrubyCppTest");
@@ -397,6 +429,7 @@ extern "C" void mrb_mruby_cpp_gem_test(mrb_state *mrb)
     mrb_define_module_function(mrb, test, "objects_survive_gc?", objects_survive_gc_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "types_stay_apart?", types_stay_apart_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "funcall_and_at?", funcall_and_at_q, MRB_ARGS_NONE());
+    mrb_define_module_function(mrb, test, "build_like_decode?", build_like_decode_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "view_ends_with_funcall?", view_ends_with_funcall_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "hash_get?", hash_get_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "lambda_block?", lambda_block_q, MRB_ARGS_NONE());
