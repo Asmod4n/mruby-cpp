@@ -96,8 +96,18 @@ end
 # A const mruby::RString gives a view that keeps its bytes while Ruby
 # changes the String: mrb_str_byte_subseq shares a long buffer and every
 # change unshares it first (src/string.c str_share, mrb_str_modify); a
-# short one is copied. state::root keeps the subsequence through a full
-# GC. A mutable mruby::RString gives a copy.
+# short one is copied. A wrapper object holds the subsequence in an
+# instance variable, and the arena holds the wrapper, as mrb_funcall holds
+# its answer, so it survives a full GC. A mutable mruby::RString gives a
+# copy.
 assert('mruby::RString: a const view stays, a mutable one copies') do
   assert_true MrubyCppTest.string_view_after_change?
+end
+
+# mruby runs the finalizer of each gem before it frees the heap. The one
+# of mruby-cpp ends the lifetime of every wrapper and takes its dfree away,
+# so a C++ object that outlives its state throws instead of reading freed
+# memory, and nothing is freed twice.
+assert('mruby::RString throws when it is read after its state ended') do
+  assert_true MrubyCppTest.string_after_close_throws?
 end

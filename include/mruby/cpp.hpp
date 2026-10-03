@@ -2,6 +2,7 @@
 #include <mruby.h>
 #include <mruby/array.h>
 #include <mruby/class.h>
+#include <mruby/data.h>
 #include <mruby/error.h>
 #include <mruby/proc.h>
 #include <mruby/string.h>
@@ -12,6 +13,7 @@
 #include <cstddef>
 #include <exception>
 #include <expected>
+#include <experimental/scope>
 #include <memory>
 #include <algorithm>
 #include <array>
@@ -100,14 +102,77 @@ inline mrb_value string_shared(mrb_state *const mrb, const mrb_value string)
     return mrb_str_byte_subseq(mrb, checked, 0, RSTRING_LEN(checked));
 }
 
+struct lifetime {
+    bool alive = true;
+};
+
+inline void lifetime_end(mrb_state *, void *const held)
+{
+    const std::unique_ptr<std::shared_ptr<lifetime>> owned(static_cast<std::shared_ptr<lifetime> *>(held));
+    if (owned != nullptr)
+        (*owned)->alive = false;
+}
+
+inline constexpr mrb_data_type wrapper{"mruby-cpp", lifetime_end};
+
+class state;
+
+class RString
+{
+    std::shared_ptr<const lifetime> life;
+    mrb_value object;
+
+    friend class state;
+    RString(std::shared_ptr<const lifetime> given_life, const mrb_value given)
+        : life(std::move(given_life)), object(given)
+    {
+    }
+
+    std::string_view kept() const
+    {
+        if (!life->alive) [[unlikely]]
+            throw std::logic_error("an mruby::RString is read after mruby freed it");
+        return string_bytes(object);
+    }
+
+  public:
+    std::string bytes() &
+    {
+        return std::string(kept());
+    }
+    std::string_view bytes() const &
+    {
+        return kept();
+    }
+};
+
 class state
 {
     struct owned {
         mrb_state *mrb = nullptr;
+        bool closes = true;
         std::thread::id owner = std::this_thread::get_id();
         std::unordered_set<mrb_value *> roots;
     };
     std::shared_ptr<owned> shared = std::make_shared<owned>();
+
+    template <class R, class F> R wrap(F &&make)
+    {
+        mrb_state *const mrb = shared->mrb;
+        const int arena = mrb_gc_arena_save(mrb);
+        std::experimental::scope_exit restore([mrb, arena] { mrb_gc_arena_restore(mrb, arena); });
+        const mrb_value object = make(mrb);
+        auto held = std::make_unique<std::shared_ptr<lifetime>>(std::make_shared<lifetime>());
+        std::shared_ptr<const lifetime> life = *held;
+        RData *const data = mrb_data_object_alloc(mrb, mrb->object_class, held.get(), &wrapper);
+        held.release();
+        const mrb_value carrier = mrb_obj_value(data);
+        mrb_iv_set(mrb, carrier, mrb_intern_lit(mrb, "__object__"), object);
+        restore.release();
+        mrb_gc_arena_restore(mrb, arena);
+        mrb_gc_protect(mrb, carrier);
+        return R(std::move(life), object);
+    }
 
   public:
     state()
@@ -116,15 +181,35 @@ class state
         if (shared->mrb == nullptr) [[unlikely]]
             throw std::bad_alloc();
     }
+    explicit state(mrb_state *const given)
+    {
+        shared->mrb = given;
+        shared->closes = false;
+    }
     state(const state &) = delete;
     state &operator=(const state &) = delete;
     ~state()
     {
-        for (mrb_value *const cell : shared->roots)
+        for (mrb_value *const cell : shared->roots) {
+            if (!shared->closes)
+                mrb_gc_unregister(shared->mrb, *cell);
             *cell = mrb_undef_value();
+        }
         shared->roots.clear();
-        mrb_close(shared->mrb);
+        if (shared->closes)
+            mrb_close(shared->mrb);
         shared->mrb = nullptr;
+    }
+    RString str_new(const std::string_view bytes)
+    {
+        return wrap<RString>([bytes](mrb_state *const mrb) {
+            return mrb_str_new(mrb, bytes.data(), static_cast<mrb_int>(bytes.size()));
+        });
+    }
+    RString ensure_string_type(const automatic &given)
+    {
+        const mrb_value value = given;
+        return wrap<RString>([value](mrb_state *const mrb) { return string_shared(mrb, value); });
     }
     mrb_state *get() const
     {
@@ -161,31 +246,6 @@ inline std::shared_ptr<const mrb_value> state::root(const automatic &value)
         });
 }
 
-class RString
-{
-    std::shared_ptr<const mrb_value> shared;
-
-    std::string_view kept() const
-    {
-        if (mrb_undef_p(*shared)) [[unlikely]]
-            throw std::logic_error("a String is read after mrb_close of its state");
-        return string_bytes(*shared);
-    }
-
-  public:
-    RString(state &owner, const automatic &given)
-        : shared(owner.root(automatic(string_shared(owner.get(), given))))
-    {
-    }
-    std::string bytes() &
-    {
-        return std::string(kept());
-    }
-    std::string_view bytes() const &
-    {
-        return kept();
-    }
-};
 
 template <class F> std::expected<mrb_value, mrb_value> protect(mrb_state *const mrb, F &&body)
 {
