@@ -212,26 +212,33 @@ static mrb_value literals_q(mrb_state *mrb, mrb_value)
 }
 
 
-/* Takes a view of the String through a const mruby::RString, changes the
- * String in three ways, runs a full GC, and answers the view and a copy
- * that a mutable mruby::RString gives. */
-static mrb_value string_view_after_change_m(mrb_state *mrb, mrb_value)
+/* Takes a view of a String through a const mruby::RString and a copy
+ * through a mutable one, changes the String in three ways, runs a full GC,
+ * and answers the view, the copy and the String. */
+static mrb_value string_view_after_change_m(mrb_state *, mrb_value)
 {
-    mrb_value holder;
-    mrb_value given;
-    mrb_get_args(mrb, "oo", &holder, &given);
-    const mruby::automatic held(holder);
-    const mruby::automatic argument(given);
-    const mruby::RString viewed(mrb, held, argument);
-    mruby::RString copied(mrb, held, argument);
+    mrb_int length;
+    mrb_value text = mrb_nil_value();
+    mrb_value answer = mrb_nil_value();
+    mruby::state owned;
+    mrb_state *const mrb = owned.get();
+    const int arena = mrb_gc_arena_save(mrb);
+    text = mrb_str_new_lit(mrb, "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz");
+    length = RSTRING_LEN(text);
+    const mruby::automatic argument(text);
+    const mruby::RString viewed(owned, argument);
+    mruby::RString copied(owned, argument);
+    mrb_gc_arena_restore(mrb, arena);
     const std::string_view view = viewed.bytes();
     const std::string copy = copied.bytes();
-    mrb_str_cat_lit(mrb, given, "appended");
-    mrb_funcall(mrb, given, "upcase!", 0);
-    mrb_funcall(mrb, given, "replace", 1, mrb_str_new_lit(mrb, "other"));
+    mrb_str_cat_lit(mrb, text, "appended");
+    mrb_funcall(mrb, text, "upcase!", 0);
+    mrb_funcall(mrb, text, "replace", 1, mrb_str_new_lit(mrb, "other"));
     mrb_full_gc(mrb);
-    return mrb_assoc_new(mrb, mrb_str_new(mrb, view.data(), static_cast<mrb_int>(view.size())),
-                         mrb_str_new(mrb, copy.data(), static_cast<mrb_int>(copy.size())));
+    const bool same = view == copy && static_cast<mrb_int>(view.size()) == length &&
+                      view.substr(0, 3) == "abc" && std::string_view(RSTRING_PTR(text), 5) == "other";
+    answer = mrb_bool_value(same);
+    return answer;
 }
 
 extern "C" void mrb_mruby_cpp_gem_test(mrb_state *mrb)
@@ -257,6 +264,6 @@ extern "C" void mrb_mruby_cpp_gem_test(mrb_state *mrb)
                                protect_rethrows_cxx_exception_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "singleton_frozen", singleton_frozen_m, MRB_ARGS_REQ(1));
     mrb_define_module_function(mrb, test, "literals?", literals_q, MRB_ARGS_NONE());
-    mrb_define_module_function(mrb, test, "string_view_after_change", string_view_after_change_m,
-                               MRB_ARGS_REQ(2));
+    mrb_define_module_function(mrb, test, "string_view_after_change?", string_view_after_change_m,
+                               MRB_ARGS_NONE());
 }

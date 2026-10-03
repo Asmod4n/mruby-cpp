@@ -100,34 +100,6 @@ inline mrb_value string_shared(mrb_state *const mrb, const mrb_value string)
     return mrb_str_byte_subseq(mrb, checked, 0, RSTRING_LEN(checked));
 }
 
-class RString
-{
-    mrb_value shared;
-
-  public:
-    RString(mrb_state *const mrb, const automatic &holder, const automatic &given)
-        : shared(string_shared(mrb, given))
-    {
-        const mrb_sym kept = mrb_intern_lit(mrb, "__RString__");
-        mrb_value list = mrb_iv_get(mrb, holder, kept);
-        if (!mrb_array_p(list)) {
-            list = mrb_ary_new(mrb);
-            mrb_iv_set(mrb, holder, kept, list);
-        }
-        mrb_ary_push(mrb, list, shared);
-    }
-    RString(const RString &) = delete;
-    RString &operator=(const RString &) = delete;
-    std::string bytes() &
-    {
-        return std::string(string_bytes(shared));
-    }
-    std::string_view bytes() const &
-    {
-        return string_bytes(shared);
-    }
-};
-
 class state
 {
     struct owned {
@@ -188,6 +160,32 @@ inline std::shared_ptr<const mrb_value> state::root(const automatic &value)
             delete p;
         });
 }
+
+class RString
+{
+    std::shared_ptr<const mrb_value> shared;
+
+    std::string_view kept() const
+    {
+        if (mrb_undef_p(*shared)) [[unlikely]]
+            throw std::logic_error("a String is read after mrb_close of its state");
+        return string_bytes(*shared);
+    }
+
+  public:
+    RString(state &owner, const automatic &given)
+        : shared(owner.root(automatic(string_shared(owner.get(), given))))
+    {
+    }
+    std::string bytes() &
+    {
+        return std::string(kept());
+    }
+    std::string_view bytes() const &
+    {
+        return kept();
+    }
+};
 
 template <class F> std::expected<mrb_value, mrb_value> protect(mrb_state *const mrb, F &&body)
 {

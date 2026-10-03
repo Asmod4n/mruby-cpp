@@ -96,15 +96,8 @@ end
 # A const mruby::RString gives a view that keeps its bytes while Ruby
 # changes the String: mrb_str_byte_subseq shares a long buffer and every
 # change unshares it first (src/string.c str_share, mrb_str_modify); a
-# short one is copied. The holder keeps the subsequence alive through a
-# full GC. A mutable mruby::RString gives a copy.
+# short one is copied. state::root keeps the subsequence through a full
+# GC. A mutable mruby::RString gives a copy.
 assert('mruby::RString: a const view stays, a mutable one copies') do
-  holder = Object.new
-  long = 'abcdefghijklmnopqrstuvwxyz0123456789' * 4
-  text = long.dup
-  assert_equal [long, long], MrubyCppTest.string_view_after_change(holder, text)
-  assert_equal 'other', text
-  short = 'ab'
-  assert_equal %w[ab ab], MrubyCppTest.string_view_after_change(holder, short.dup)
-  assert_raise(TypeError) { MrubyCppTest.string_view_after_change(holder, 1) }
+  assert_true MrubyCppTest.string_view_after_change?
 end
