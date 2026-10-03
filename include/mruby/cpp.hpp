@@ -3,6 +3,7 @@
 #include <mruby/array.h>
 #include <mruby/class.h>
 #include <mruby/data.h>
+#include <mruby/hash.h>
 #include <mruby/error.h>
 #include <mruby/proc.h>
 #include <mruby/string.h>
@@ -96,11 +97,16 @@ inline std::string_view string_bytes(const mrb_value string)
     return {RSTRING_PTR(string), static_cast<std::size_t>(RSTRING_LEN(string))};
 }
 
-inline mrb_value string_shared(mrb_state *const mrb, const mrb_value string)
+inline std::size_t array_length(const mrb_value array)
 {
-    const mrb_value checked = mrb_ensure_string_type(mrb, string);
-    return mrb_str_byte_subseq(mrb, checked, 0, RSTRING_LEN(checked));
+    return static_cast<std::size_t>(RARRAY_LEN(array));
 }
+
+inline std::string_view class_name(mrb_state *const mrb, const mrb_value klass)
+{
+    return mrb_class_name(mrb, mrb_class_ptr(klass));
+}
+
 
 struct lifetime {
     bool alive = true;
@@ -117,32 +123,93 @@ inline constexpr mrb_data_type wrapper{"mruby-cpp", lifetime_end};
 
 class state;
 
-class RString
+class handle
 {
     std::shared_ptr<const lifetime> life;
+    mrb_state *mrb;
     mrb_value object;
 
-    friend class state;
-    RString(std::shared_ptr<const lifetime> given_life, const mrb_value given)
-        : life(std::move(given_life)), object(given)
+  public:
+    handle(std::shared_ptr<const lifetime> given_life, mrb_state *const given_mrb, const mrb_value given)
+        : life(std::move(given_life)), mrb(given_mrb), object(given)
     {
     }
-
-    std::string_view kept() const
+    mrb_state *state() const
     {
         if (!life->alive) [[unlikely]]
-            throw std::logic_error("an mruby::RString is read after mruby freed it");
-        return string_bytes(object);
+            throw std::logic_error("an mruby object is used after mruby freed it");
+        return mrb;
+    }
+    mrb_value value() const
+    {
+        (void)state();
+        return object;
+    }
+};
+
+class RString
+{
+    handle held;
+    friend class state;
+    explicit RString(handle given) : held(std::move(given))
+    {
     }
 
   public:
     std::string bytes() &
     {
-        return std::string(kept());
+        return std::string(string_bytes(held.value()));
     }
     std::string_view bytes() const &
     {
-        return kept();
+        return string_bytes(held.value());
+    }
+};
+
+class RArray
+{
+    handle held;
+    friend class state;
+    explicit RArray(handle given) : held(std::move(given))
+    {
+    }
+
+  public:
+    std::size_t size() const
+    {
+        return array_length(held.value());
+    }
+};
+
+class RHash
+{
+    handle held;
+    friend class state;
+    explicit RHash(handle given) : held(std::move(given))
+    {
+    }
+
+  public:
+    std::size_t size() const
+    {
+        mrb_state *const mrb = held.state();
+        return static_cast<std::size_t>(mrb_hash_size(mrb, held.value()));
+    }
+};
+
+class RClass
+{
+    handle held;
+    friend class state;
+    explicit RClass(handle given) : held(std::move(given))
+    {
+    }
+
+  public:
+    std::string_view name() const
+    {
+        mrb_state *const mrb = held.state();
+        return class_name(mrb, held.value());
     }
 };
 
@@ -171,7 +238,7 @@ class state
         restore.release();
         mrb_gc_arena_restore(mrb, arena);
         mrb_gc_protect(mrb, carrier);
-        return R(std::move(life), object);
+        return R(handle(std::move(life), mrb, object));
     }
 
   public:
@@ -206,10 +273,19 @@ class state
             return mrb_str_new(mrb, bytes.data(), static_cast<mrb_int>(bytes.size()));
         });
     }
-    RString ensure_string_type(const automatic &given)
+    RArray ary_new()
     {
-        const mrb_value value = given;
-        return wrap<RString>([value](mrb_state *const mrb) { return string_shared(mrb, value); });
+        return wrap<RArray>([](mrb_state *const mrb) { return mrb_ary_new(mrb); });
+    }
+    RHash hash_new()
+    {
+        return wrap<RHash>([](mrb_state *const mrb) { return mrb_hash_new(mrb); });
+    }
+    RClass define_class(const std::string &name)
+    {
+        return wrap<RClass>([&name](mrb_state *const mrb) {
+            return mrb_obj_value(mrb_define_class(mrb, name.c_str(), mrb->object_class));
+        });
     }
     mrb_state *get() const
     {

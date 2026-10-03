@@ -93,15 +93,16 @@ assert('mruby::symbol and mruby::str_new_static read a literal') do
   assert_true MrubyCppTest.literals?
 end
 
-# A const mruby::RString gives a view that keeps its bytes while Ruby
-# changes the String: mrb_str_byte_subseq shares a long buffer and every
-# change unshares it first (src/string.c str_share, mrb_str_modify); a
-# short one is copied. A wrapper object holds the subsequence in an
-# instance variable, and the arena holds the wrapper, as mrb_funcall holds
-# its answer, so it survives a full GC. A mutable mruby::RString gives a
-# copy.
-assert('mruby::RString: a const view stays, a mutable one copies') do
-  assert_true MrubyCppTest.string_view_after_change?
+# Each object that C++ makes lives in a wrapper that the arena holds, as
+# mrb_funcall holds its answer, so a full GC frees none of them.
+assert('mruby objects made by C++ survive a full GC') do
+  assert_true MrubyCppTest.objects_survive_gc?
+end
+
+# A method of one type does not compile on another, and no type converts
+# to another or to and from mrb_value.
+assert('mruby types stay apart at compile time') do
+  assert_true MrubyCppTest.types_stay_apart?
 end
 
 # mruby runs the finalizer of each gem before it frees the heap. The one
