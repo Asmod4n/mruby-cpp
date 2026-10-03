@@ -112,3 +112,33 @@ end
 assert('mruby::RString throws when it is read after its state ended') do
   assert_true MrubyCppTest.string_after_close_throws?
 end
+
+# One funcall replaces mrb_funcall, _id, _argv and _with_block; the method
+# is a presym. at<T> answers only when the element has that type.
+assert('mruby funcall with a presym, and at<T> by type') do
+  assert_true MrubyCppTest.funcall_and_at?
+end
+
+# Ruby can change any container while it runs, so a view read before a
+# call into the VM throws after it; an object made from the view stays.
+assert('mruby views end when Ruby runs') do
+  assert_true MrubyCppTest.view_ends_with_funcall?
+end
+
+# get<T> uses mrb_hash_fetch, which calls no default proc, and takes only
+# keys whose hash and eql? mruby answers in C (src/hash.c), so no Ruby runs.
+assert('mruby RHash#get by type') do
+  assert_true MrubyCppTest.hash_get?
+end
+
+# A C++ lambda becomes the block of the call; an argument of another type
+# raises TypeError before the lambda runs.
+assert('mruby a C++ lambda as a block') do
+  assert_true MrubyCppTest.lambda_block?
+end
+
+# A C++ exception thrown in the block leaves through mruby as a raise and
+# is thrown again after the call; a Ruby raise arrives as runtime_error.
+assert('mruby errors pass through funcall') do
+  assert_true MrubyCppTest.errors_pass?
+end

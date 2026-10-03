@@ -6,6 +6,7 @@
 #include <mruby/string.h>
 #include <mruby/variable.h>
 #include <mruby/cpp.hpp>
+#include <mruby/presym.h>
 
 #include <memory>
 #include <optional>
@@ -275,6 +276,101 @@ static mrb_value string_after_close_throws_q(mrb_state *, mrb_value)
     return mrb_false_value();
 }
 
+
+/* funcall with a presym: push returns the Array, size returns an Integer,
+ * at<T> reads an element as the type it asks for and is empty for another
+ * type or an index outside. */
+static mrb_value funcall_and_at_q(mrb_state *, mrb_value)
+{
+    mruby::state owned;
+    const mruby::RArray array = owned.ary_new();
+    const mruby::RString text = owned.str_new("abc");
+    owned.funcall<MRB_SYM(push)>(array, text);
+    owned.funcall<MRB_SYM(push)>(array, mrb_int{7});
+    const std::optional<mrb_int> size = owned.funcall<MRB_SYM(size), mrb_int>(array);
+    const std::optional<mruby::RString::view> first = array.at<mruby::RString>(0);
+    const std::optional<mrb_int> second = array.at<mrb_int>(1);
+    return mrb_bool_value(size == 2 && first && first->bytes() == "abc" && second == 7 &&
+                          !array.at<mruby::RHash>(0) && !array.at<mruby::RString>(1) &&
+                          !array.at<mruby::RString>(2));
+}
+
+/* A view read before a funcall throws after it, because Ruby ran in between.
+ * An RString made from the view stays readable. */
+static mrb_value view_ends_with_funcall_q(mrb_state *, mrb_value)
+{
+    mruby::state owned;
+    const mruby::RArray array = owned.ary_new();
+    owned.funcall<MRB_SYM(push)>(array, owned.str_new("abc"));
+    const mruby::RString::view seen = *array.at<mruby::RString>(0);
+    const mruby::RString kept(seen);
+    owned.funcall<MRB_SYM(size), mrb_int>(array);
+    bool threw = false;
+    try {
+        (void)seen.bytes();
+    } catch (const std::logic_error &) {
+        threw = true;
+    }
+    return mrb_bool_value(threw && kept.bytes() == "abc");
+}
+
+/* get<T> finds a value by a String or an Integer key through
+ * mrb_hash_fetch, and is empty for a missing key or another type. */
+static mrb_value hash_get_q(mrb_state *, mrb_value)
+{
+    mruby::state owned;
+    const mruby::RHash hash = owned.hash_new();
+    const mruby::RString key = owned.str_new("k");
+    owned.funcall<MRB_OPSYM(aset)>(hash, key, owned.str_new("v"));
+    owned.funcall<MRB_OPSYM(aset)>(hash, mrb_int{1}, mrb_int{2});
+    const std::optional<mruby::RString::view> found = hash.get<mruby::RString>(key);
+    return mrb_bool_value(found && found->bytes() == "v" && hash.get<mrb_int>(mrb_int{1}) == 2 &&
+                          !hash.get<mrb_int>(mrb_int{3}) && !hash.get<mruby::RArray>(key));
+}
+
+/* A C++ lambda is the block of a call; each argument is checked against
+ * its parameter type. */
+static mrb_value lambda_block_q(mrb_state *, mrb_value)
+{
+    mruby::state owned;
+    const mruby::RArray array = owned.ary_new();
+    owned.funcall<MRB_SYM(push)>(array, owned.str_new("ab"));
+    owned.funcall<MRB_SYM(push)>(array, owned.str_new("cde"));
+    std::size_t total = 0;
+    owned.funcall<MRB_SYM(each)>(array, [&total](const mruby::RString::view text) {
+        total += text.bytes().size();
+    });
+    bool wrong_type = false;
+    try {
+        owned.funcall<MRB_SYM(each)>(array, [](const mrb_int) {});
+    } catch (const std::runtime_error &) {
+        wrong_type = true;
+    }
+    return mrb_bool_value(total == 5 && wrong_type);
+}
+
+/* A C++ exception from the block reaches the caller of funcall as it is,
+ * and a Ruby raise arrives as std::runtime_error with its message. */
+static mrb_value errors_pass_q(mrb_state *, mrb_value)
+{
+    mruby::state owned;
+    const mruby::RArray array = owned.ary_new();
+    owned.funcall<MRB_SYM(push)>(array, mrb_int{1});
+    bool cxx = false;
+    try {
+        owned.funcall<MRB_SYM(each)>(array, [](const mrb_int) { throw std::domain_error("from C++"); });
+    } catch (const std::domain_error &) {
+        cxx = true;
+    }
+    bool ruby = false;
+    try {
+        owned.funcall<MRB_SYM(raise)>(array, owned.str_new("raised in Ruby"));
+    } catch (const std::runtime_error &e) {
+        ruby = std::string_view(e.what()) == "raised in Ruby";
+    }
+    return mrb_bool_value(cxx && ruby);
+}
+
 extern "C" void mrb_mruby_cpp_gem_test(mrb_state *mrb)
 {
     RClass *const test = mrb_define_module(mrb, "MrubyCppTest");
@@ -300,6 +396,11 @@ extern "C" void mrb_mruby_cpp_gem_test(mrb_state *mrb)
     mrb_define_module_function(mrb, test, "literals?", literals_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "objects_survive_gc?", objects_survive_gc_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "types_stay_apart?", types_stay_apart_q, MRB_ARGS_NONE());
+    mrb_define_module_function(mrb, test, "funcall_and_at?", funcall_and_at_q, MRB_ARGS_NONE());
+    mrb_define_module_function(mrb, test, "view_ends_with_funcall?", view_ends_with_funcall_q, MRB_ARGS_NONE());
+    mrb_define_module_function(mrb, test, "hash_get?", hash_get_q, MRB_ARGS_NONE());
+    mrb_define_module_function(mrb, test, "lambda_block?", lambda_block_q, MRB_ARGS_NONE());
+    mrb_define_module_function(mrb, test, "errors_pass?", errors_pass_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "string_after_close_throws?", string_after_close_throws_q,
                                MRB_ARGS_NONE());
 }
