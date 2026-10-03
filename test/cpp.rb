@@ -142,3 +142,11 @@ end
 assert('mruby errors pass through funcall') do
   assert_true MrubyCppTest.errors_pass?
 end
+
+# A decoder makes every child as a view and wraps only the root. A child
+# that is attached leaves the arena again, so the arena stays as deep as
+# the nesting, not as long as the document, and a full GC frees nothing
+# the root reaches.
+assert('mruby builds a tree of views under one wrapped root') do
+  assert_true MrubyCppTest.build_like_decode?
+end
