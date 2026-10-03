@@ -89,6 +89,45 @@ inline frozen::frozen(mrb_state *const mrb, const automatic &given)
 
 template <class F> std::expected<mrb_value, mrb_value> protect(mrb_state *const mrb, F &&body);
 
+inline std::string_view string_bytes(const mrb_value string)
+{
+    return {RSTRING_PTR(string), static_cast<std::size_t>(RSTRING_LEN(string))};
+}
+
+inline mrb_value string_shared(mrb_state *const mrb, const mrb_value string)
+{
+    const mrb_value checked = mrb_ensure_string_type(mrb, string);
+    return mrb_str_byte_subseq(mrb, checked, 0, RSTRING_LEN(checked));
+}
+
+class RString
+{
+    mrb_value shared;
+
+  public:
+    RString(mrb_state *const mrb, const automatic &holder, const automatic &given)
+        : shared(string_shared(mrb, given))
+    {
+        const mrb_sym kept = mrb_intern_lit(mrb, "__RString__");
+        mrb_value list = mrb_iv_get(mrb, holder, kept);
+        if (!mrb_array_p(list)) {
+            list = mrb_ary_new(mrb);
+            mrb_iv_set(mrb, holder, kept, list);
+        }
+        mrb_ary_push(mrb, list, shared);
+    }
+    RString(const RString &) = delete;
+    RString &operator=(const RString &) = delete;
+    std::string bytes() &
+    {
+        return std::string(string_bytes(shared));
+    }
+    std::string_view bytes() const &
+    {
+        return string_bytes(shared);
+    }
+};
+
 class state
 {
     struct owned {

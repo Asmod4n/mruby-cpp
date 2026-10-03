@@ -9,6 +9,7 @@
 
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -210,6 +211,29 @@ static mrb_value literals_q(mrb_state *mrb, mrb_value)
                           RSTRING_LEN(text) == 3);
 }
 
+
+/* Takes a view of the String through a const mruby::RString, changes the
+ * String in three ways, runs a full GC, and answers the view and a copy
+ * that a mutable mruby::RString gives. */
+static mrb_value string_view_after_change_m(mrb_state *mrb, mrb_value)
+{
+    mrb_value holder;
+    mrb_value given;
+    mrb_get_args(mrb, "oo", &holder, &given);
+    const mruby::automatic held(holder);
+    const mruby::automatic argument(given);
+    const mruby::RString viewed(mrb, held, argument);
+    mruby::RString copied(mrb, held, argument);
+    const std::string_view view = viewed.bytes();
+    const std::string copy = copied.bytes();
+    mrb_str_cat_lit(mrb, given, "appended");
+    mrb_funcall(mrb, given, "upcase!", 0);
+    mrb_funcall(mrb, given, "replace", 1, mrb_str_new_lit(mrb, "other"));
+    mrb_full_gc(mrb);
+    return mrb_assoc_new(mrb, mrb_str_new(mrb, view.data(), static_cast<mrb_int>(view.size())),
+                         mrb_str_new(mrb, copy.data(), static_cast<mrb_int>(copy.size())));
+}
+
 extern "C" void mrb_mruby_cpp_gem_test(mrb_state *mrb)
 {
     RClass *const test = mrb_define_module(mrb, "MrubyCppTest");
@@ -233,4 +257,6 @@ extern "C" void mrb_mruby_cpp_gem_test(mrb_state *mrb)
                                protect_rethrows_cxx_exception_q, MRB_ARGS_NONE());
     mrb_define_module_function(mrb, test, "singleton_frozen", singleton_frozen_m, MRB_ARGS_REQ(1));
     mrb_define_module_function(mrb, test, "literals?", literals_q, MRB_ARGS_NONE());
+    mrb_define_module_function(mrb, test, "string_view_after_change", string_view_after_change_m,
+                               MRB_ARGS_REQ(2));
 }
